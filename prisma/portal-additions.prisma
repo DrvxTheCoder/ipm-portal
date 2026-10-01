@@ -1,0 +1,95 @@
+// Portail participant — schema additions proposed for senexus-multiapp.
+// Not applied anywhere yet: this is the delta the prototype is built on.
+
+enum IpmVoucherStatus {
+  PENDING_REVIEW // NEW — above the review threshold, waiting for the gestionnaire
+  ISSUED
+  PRESENTED
+  SETTLED
+  INVOICED
+  CANCELLED
+  EXPIRED
+  REJECTED // NEW — refused at review
+}
+
+enum IpmVoucherOrigin {
+  BACKOFFICE
+  PORTAL
+}
+
+enum IpmVoucherEntryMode {
+  SCAN
+  MANUAL
+}
+
+enum IpmReviewFlag {
+  ABOVE_THRESHOLD
+  AMOUNT_UNUSUAL
+  SAME_DAY_DUPLICATE
+  RECEIPT_REUSED
+  OCR_MISMATCH
+}
+
+enum PortalAccountStatus {
+  INVITED
+  ACTIVE
+  LOCKED
+}
+
+model IpmVoucher {
+  // ...existing fields...
+  origin                  IpmVoucherOrigin     @default(BACKOFFICE)
+  issuedByPortalAccountId String?
+  entryMode               IpmVoucherEntryMode?
+  /// Zipline URL. Mandatory for origin = PORTAL (enforced in the action).
+  receiptUrl              String?
+  /// dHash, 16 hex chars — detects a receipt photo reused for another bon.
+  receiptHash             String?
+  /// Total read from the receipt, kept to explain OCR_MISMATCH.
+  ocrTotal                Decimal?             @db.Decimal(12, 2)
+  reviewFlags             IpmReviewFlag[]
+  reviewedById            String?
+  reviewedAt              DateTime?
+  reviewReason            String?
+
+  issuedByPortalAccount PortalAccount? @relation(fields: [issuedByPortalAccountId], references: [id])
+  reviewedBy            User?          @relation("IpmVoucherReviewer", fields: [reviewedById], references: [id])
+
+  @@index([firmId, receiptHash])
+}
+
+/// The participant's login. Deliberately not a User: no UserFirm, no route
+/// into the back office, its own session cookie.
+model PortalAccount {
+  id          String              @id @default(cuid())
+  firmId      String
+  memberId    String              @unique
+  /// National format, 9 digits. Copied from Person.phone at activation.
+  phone       String
+  status      PortalAccountStatus @default(INVITED)
+  activatedAt DateTime?
+  lastLoginAt DateTime?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  firm     Firm         @relation(fields: [firmId], references: [id], onDelete: Cascade)
+  member   Member       @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  vouchers IpmVoucher[]
+
+  @@unique([firmId, phone])
+  @@map("ipm_portal_accounts")
+}
+
+/// Review policy, one row per IPM.
+model IpmPortalSettings {
+  firmId                String  @id
+  /// FCFA. Above it (or above the ratio below, whichever is lower) a bon waits.
+  reviewThresholdAmount Decimal @default(100000) @db.Decimal(12, 2)
+  reviewThresholdRatio  Decimal @default(0.5) @db.Decimal(5, 4)
+  unusualAmountMultiple Decimal @default(3) @db.Decimal(5, 2)
+  ocrMismatchTolerance  Decimal @default(0.15) @db.Decimal(5, 4)
+
+  firm Firm @relation(fields: [firmId], references: [id], onDelete: Cascade)
+
+  @@map("ipm_portal_settings")
+}
