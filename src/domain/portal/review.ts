@@ -110,4 +110,5 @@ export const FLAG_LABELS: Record<IpmReviewFlag, string> = {
   SAME_DAY_DUPLICATE: "Autre bon le même jour, même prestataire",
   RECEIPT_REUSED: "Reçu déjà utilisé pour un autre bon",
   OCR_MISMATCH: "Montant différent de celui lu sur le reçu",
+  ISSUANCE_WARNING: "Avertissement à l'émission (cotisations en retard ou convention échue)",
 }

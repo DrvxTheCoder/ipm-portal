@@ -14,7 +14,8 @@ export default function CartePage() {
   const [holder, ...dependents] = family(db, memberId)
   const member = db.members.find((m) => m.id === memberId)!
   const employer = db.employers.find((e) => e.id === member.employerId)!
-  const plan = db.plans.find((p) => p.id === employer.planId)!
+  // No formule for an employer on a negotiated flat rate.
+  const plan = employer.planId ? db.plans.find((p) => p.id === employer.planId) : undefined
   const card = db.cards.find((c) => c.memberId === memberId)
 
   // The artwork has room for two rates; like the module, print the first two
@@ -22,7 +23,7 @@ export default function CartePage() {
   const coverage: CardCoverage[] = [...db.categories]
     .sort((a, b) => a.sortOrder - b.sortOrder)
     .flatMap((category) => {
-      const rate = resolveFor(db, memberId, category.id, "MEMBER")
+      const rate = resolveFor(db, category.id, "MEMBER")
       return rate ? [{ label: category.label, rate: rate.rate }] : []
     })
     .slice(0, 2)
@@ -34,7 +35,7 @@ export default function CartePage() {
         <IpmCard
           holder={holder}
           dependents={dependents}
-          planName={plan.name}
+          planName={plan?.name ?? null}
           employerName={employer.name}
           coverage={coverage}
           qrValue={verifyUrl(`carte-${holder.matricule}-v${card?.version ?? 1}`)}

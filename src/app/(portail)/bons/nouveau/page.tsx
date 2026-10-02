@@ -15,6 +15,7 @@ import {
   Clock01Icon,
   Delete02Icon,
   FileScanIcon,
+  Loading03Icon,
   PencilEdit02Icon,
   Search01Icon,
   Tick02Icon,
@@ -34,10 +35,10 @@ import { Qr, verifyUrl } from "@/components/portal/qr"
 import { VOUCHER_TYPE_META } from "@/components/portal/meta"
 import { useStore } from "@/lib/store"
 import { family, type FamilyMember } from "@/lib/queries"
-import { VOUCHER_TYPE_SPECIALTIES } from "@/lib/mock-data"
-import { draftTotal, preview, type DraftLine, type VoucherDraft } from "@/domain/portal/issue"
+import { bookingFor, draftTotal, eligibleProviders, preview, type DraftInput } from "@/domain/portal/issue"
+import { ApiError, dataUrlToBlob, NETWORK_MESSAGE } from "@/lib/api"
 import { francs, grouped, longDate } from "@/lib/format"
-import type { IpmProvider, IpmVoucher, IpmVoucherType } from "@/lib/schema"
+import type { Db, DraftLine, IpmProvider, IpmVoucher, IpmVoucherType, PortalBooking } from "@/lib/schema"
 import { cn } from "@/lib/utils"
 
 gsap.registerPlugin(useGSAP)
@@ -61,12 +62,25 @@ const TITLES: Record<StepKey, string> = {
   recap: "Vérifiez avant de valider",
 }
 
-const SPECIALTY_TO_TYPE: Record<string, IpmVoucherType> = {
-  spec_pharma: "PHARMACY",
-  spec_optique: "OPTICAL",
-  spec_clinique: "GUARANTEE",
-  spec_labo: "GUARANTEE",
-  spec_generaliste: "GUARANTEE",
+/** The type of bon a provider's specialty points to, when exactly one booking names it. */
+function typeForSpecialty(db: Db, specialtyId: string | null): IpmVoucherType | null {
+  if (!specialtyId) return null
+  const matches = db.bookings.filter((b) => b.specialtyIds.includes(specialtyId))
+  return matches.length === 1 ? matches[0].type : null
+}
+
+/**
+ * What the server said about the last submission, shown on the summary.
+ * `retry`: the request may not have arrived. The same `clientRequestId` is
+ * sent again, so a bon that was in fact written is returned, not duplicated.
+ */
+type SubmitFailure = { kind: "refused"; messages: string[] } | { kind: "retry"; message: string }
+
+function describeFailure(error: unknown): SubmitFailure {
+  if (!(error instanceof ApiError)) return { kind: "retry", message: NETWORK_MESSAGE }
+  if (error.isNetwork || error.status >= 500 || error.code === "RETRY") return { kind: "retry", message: error.message }
+  if (error.refusals.length > 0) return { kind: "refused", messages: error.refusals }
+  return { kind: "refused", messages: [error.message] }
 }
 
 const STOP = new Set(["pharmacie", "pharma", "clinique", "optique", "hopital", "cabinet", "medical", "centre", "institut", "de", "la", "le", "du", "des", "et"])
@@ -123,6 +137,11 @@ function NewVoucherFlow() {
   const [receipt, setReceipt] = useState<CapturedReceipt | null>(null)
   const [issued, setIssued] = useState<IpmVoucher | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [failure, setFailure] = useState<{ key: string; value: SubmitFailure } | null>(null)
+  // Idempotency key for this exact draft. A ref, not state: a double tap must
+  // see the key the first tap just made.
+  const request = useRef<{ key: string; id: string } | null>(null)
+  const busy = useRef(false)
   const online = useOnline()
 
   const path = PATHS[mode]
@@ -140,20 +159,24 @@ function NewVoucherFlow() {
     else go(-1)
   }
 
-  const draft: VoucherDraft | null =
+  const booking = type ? bookingFor(db, type) : null
+  const draft: DraftInput | null =
     type && providerId && dependentId !== undefined
       ? {
           type,
           dependentId,
           providerId,
           entryMode: mode,
-          lines,
-          manualTotal,
-          receiptUrl: receipt?.receiptUrl ?? null,
+          // "Saisir seulement le total" means the total, whatever lines were typed.
+          lines: detailOpen ? lines : [],
+          total: manualTotal || null,
           receiptHash: receipt?.receiptHash ?? null,
           ocrTotal: receipt?.ocr?.total ?? null,
         }
       : null
+  // Identifies the draft as submitted: any change to it, or another photo, is a new request.
+  const draftKey = draft ? JSON.stringify([draft, receipt?.receiptUrl.length ?? 0]) : ""
+  const shownFailure = failure?.key === draftKey ? failure.value : null
 
   function onScanned(captured: CapturedReceipt) {
     setReceipt(captured)
@@ -168,7 +191,8 @@ function NewVoucherFlow() {
     if (matched) {
       setProviderId(matched.id)
       setOcrProviderId(matched.id)
-      if (matched.specialtyId) setType(SPECIALTY_TO_TYPE[matched.specialtyId] ?? null)
+      const guessed = typeForSpecialty(db, matched.specialtyId)
+      if (guessed) setType(guessed)
     }
     if (ocr?.total) {
       toast.success(`Montant lu : ${francs(ocr.total)}`, {
@@ -190,26 +214,35 @@ function NewVoucherFlow() {
     go(1)
   }
 
-  function submit() {
-    if (!draft) return
+  async function submit() {
+    if (!draft || !receipt || busy.current) return
     // Issuing is the one thing the portal refuses offline: the IPM must see
     // the bon (ceilings, review) before a provider can be shown its QR.
     if (!navigator.onLine) {
-      toast.error("Connexion requise pour créer un bon.")
+      setFailure({ key: draftKey, value: { kind: "retry", message: NETWORK_MESSAGE } })
       return
     }
+    if (request.current?.key !== draftKey) request.current = { key: draftKey, id: crypto.randomUUID() }
+    const clientRequestId = request.current.id
+
+    busy.current = true
     setSubmitting(true)
+    setFailure(null)
     try {
-      const voucher = issue(draft)
+      const blob = await dataUrlToBlob(receipt.receiptUrl)
+      const voucher = await issue({ ...draft, clientRequestId }, blob)
       setIssued(voucher)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Le bon n'a pas pu être créé.")
+      setFailure({ key: draftKey, value: describeFailure(error) })
+      // Another account used this id (should never happen): the next try needs a new one.
+      if (error instanceof ApiError && error.code === "REQUEST_ID_CONFLICT") request.current = null
     } finally {
+      busy.current = false
       setSubmitting(false)
     }
   }
 
-  if (issued) return <Done voucher={issued} providerName={db.providers.find((p) => p.id === issued.providerId)!.name} />
+  if (issued) return <Done voucher={issued} providerName={db.providers.find((p) => p.id === issued.providerId)?.name ?? "votre prestataire"} />
 
   return (
     <div className="flex min-h-dvh flex-col px-5 pt-[max(env(safe-area-inset-top),14px)] pb-6">
@@ -311,7 +344,8 @@ function NewVoucherFlow() {
 
             {step === "type" && (
               <div className="grid grid-cols-2 gap-3">
-                {(Object.keys(VOUCHER_TYPE_META) as IpmVoucherType[]).map((key) => {
+                {/* Only the types this IPM books: a type with no booking is not offered. */}
+                {(Object.keys(VOUCHER_TYPE_META) as IpmVoucherType[]).filter((key) => bookingFor(db, key)).map((key) => {
                   const meta = VOUCHER_TYPE_META[key]
                   return (
                     <button
@@ -319,8 +353,8 @@ function NewVoucherFlow() {
                       type="button"
                       onClick={() => {
                         if (type !== key) {
-                          const current = db.providers.find((p) => p.id === providerId)
-                          if (!current?.specialtyId || !VOUCHER_TYPE_SPECIALTIES[key].includes(current.specialtyId)) setProviderId(null)
+                          const next = bookingFor(db, key)!
+                          if (!eligibleProviders(db, next).some((p) => p.id === providerId)) setProviderId(null)
                         }
                         setType(key)
                         go(1)
@@ -343,9 +377,9 @@ function NewVoucherFlow() {
               </div>
             )}
 
-            {step === "provider" && type && (
+            {step === "provider" && booking && (
               <ProviderPicker
-                type={type}
+                booking={booking}
                 selected={providerId}
                 fromReceipt={ocrProviderId}
                 onPick={(id) => {
@@ -393,8 +427,17 @@ function NewVoucherFlow() {
               </div>
             )}
 
-            {step === "recap" && draft && who && (
-              <Recap draft={draft} who={who} submitting={submitting} onSubmit={submit} onEditAmount={() => { setDirection(-1); setStepIndex(path.indexOf("amount")) }} />
+            {step === "recap" && draft && booking && who && (
+              <Recap
+                draft={draft}
+                booking={booking}
+                receiptUrl={receipt?.receiptUrl ?? null}
+                who={who}
+                submitting={submitting}
+                failure={shownFailure}
+                onSubmit={() => void submit()}
+                onEditAmount={() => { setDirection(-1); setStepIndex(path.indexOf("amount")) }}
+              />
             )}
           </motion.div>
         </AnimatePresence>
@@ -406,26 +449,24 @@ function NewVoucherFlow() {
 /* ------------------------------------------------------------------------ */
 
 function ProviderPicker({
-  type,
+  booking,
   selected,
   fromReceipt,
   onPick,
 }: {
-  type: IpmVoucherType
+  booking: PortalBooking
   selected: string | null
   fromReceipt: string | null
   onPick: (id: string) => void
 }) {
   const { db, session } = useStore()
   const [query, setQuery] = useState("")
-  const specialties = VOUCHER_TYPE_SPECIALTIES[type]
 
   const recentIds = db.vouchers
     .filter((v) => v.memberId === session!.memberId)
     .map((v) => v.providerId)
-  const eligible = db.providers
-    .filter((p) => p.accredited && p.status === "ACTIVE" && p.specialtyId && specialties.includes(p.specialtyId))
-    .filter((p) => !query || `${p.name} ${p.address}`.toLowerCase().includes(query.toLowerCase()))
+  const eligible = eligibleProviders(db, booking)
+    .filter((p) => !query || `${p.name} ${p.address ?? ""}`.toLowerCase().includes(query.toLowerCase()))
     .sort((a, b) => {
       const ra = recentIds.indexOf(a.id)
       const rb = recentIds.indexOf(b.id)
@@ -503,8 +544,8 @@ function AmountStep({
   ocrTotal: number | null
   onNext: () => void
 }) {
-  const computed = draftTotal({ lines: detailOpen ? lines : [], manualTotal: total })
-  const fromLines = detailOpen && lines.some((l) => l.unitPrice > 0)
+  const computed = draftTotal({ lines: detailOpen ? lines : [], total })
+  const fromLines = detailOpen && lines.some((l) => l.label.trim() && l.quantity > 0 && l.unitPrice > 0)
 
   function update(index: number, patch: Partial<DraftLine>) {
     setLines(lines.map((line, i) => (i === index ? { ...line, ...patch } : line)))
@@ -597,22 +638,38 @@ function AmountStep({
 
 function Recap({
   draft,
+  booking,
+  receiptUrl,
   who,
   submitting,
+  failure,
   onSubmit,
   onEditAmount,
 }: {
-  draft: VoucherDraft
+  draft: DraftInput
+  booking: PortalBooking
+  receiptUrl: string | null
   who: FamilyMember
   submitting: boolean
+  failure: SubmitFailure | null
   onSubmit: () => void
   onEditAmount: () => void
 }) {
   const { db, session } = useStore()
-  const result = preview(db, session!.memberId, draft)
+  // Instant feedback only: the server decides at issue, and its refusals,
+  // when it has any, replace these.
+  const result = preview(db, session!.memberId, booking, draft)
   const provider = db.providers.find((p) => p.id === draft.providerId)!
   const meta = VOUCHER_TYPE_META[draft.type]
   const hold = result.review?.hold ?? false
+  const aboveThreshold = result.review?.flags.includes("ABOVE_THRESHOLD") ?? false
+  const refusals =
+    failure?.kind === "refused"
+      ? failure.messages
+      : result.decision.allowed
+        ? []
+        : result.decision.refusals.map((r) => r.message)
+  const ceilingRefused = !result.decision.allowed && result.decision.refusals.some((r) => r.code === "CEILING_REACHED")
 
   return (
     <div className="flex flex-1 flex-col">
@@ -623,9 +680,9 @@ function Recap({
             <p className="font-semibold">{who.name}</p>
             <p className="truncate text-sm text-ink-3">{meta.label} chez {provider.name}</p>
           </div>
-          {draft.receiptUrl && (
+          {receiptUrl && (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={draft.receiptUrl} alt="Reçu" className="size-12 rounded-lg object-cover ring-1 ring-line" />
+            <img src={receiptUrl} alt="Reçu" className="size-12 rounded-lg object-cover ring-1 ring-line" />
           )}
         </div>
         <div className="p-4">
@@ -641,41 +698,64 @@ function Recap({
         </div>
       </div>
 
-      {!result.decision.allowed && (
-        <div className="mt-4 rounded-2xl bg-red-tint p-4 text-red">
+      {refusals.length > 0 && (
+        <div role="alert" className="mt-4 rounded-2xl bg-red-tint p-4 text-red">
           <p className="flex items-center gap-2 font-semibold">
             <HugeiconsIcon icon={Alert02Icon} className="size-5" />
             Ce bon ne peut pas être créé
           </p>
           <ul className="mt-2 space-y-1.5 text-[0.95rem]">
-            {result.decision.refusals.map((refusal) => (
-              <li key={refusal.code}>{refusal.message}</li>
+            {refusals.map((message) => (
+              <li key={message}>{message}</li>
             ))}
           </ul>
-          {result.decision.refusals.some((r) => r.code === "CEILING_REACHED") && (
+          {ceilingRefused && (
             <button type="button" onClick={onEditAmount} className="mt-3 font-semibold underline underline-offset-2">Modifier le montant</button>
           )}
         </div>
       )}
 
-      {result.decision.allowed && hold && (
-        <div className="mt-4 flex gap-3 rounded-2xl bg-amber-tint p-4 text-amber">
-          <HugeiconsIcon icon={Clock01Icon} className="mt-0.5 size-5 shrink-0" />
+      {failure?.kind === "retry" && (
+        <div role="alert" className="mt-4 flex gap-3 rounded-2xl bg-amber-tint p-4 text-amber">
+          <HugeiconsIcon icon={Alert02Icon} className="mt-0.5 size-5 shrink-0" />
           <p className="text-[0.95rem]">
-            Au-delà de {francs(result.review!.threshold)}, l&apos;IPM valide le bon avant que vous puissiez l&apos;utiliser.
-            Vous serez prévenu par SMS.
+            {failure.message} Votre saisie est conservée : appuyez sur « Réessayer ».
           </p>
         </div>
       )}
 
-      {result.decision.allowed && !hold && result.remainingMonthly !== null && (
+      {refusals.length === 0 && !failure && hold && (
+        <div className="mt-4 flex gap-3 rounded-2xl bg-amber-tint p-4 text-amber">
+          <HugeiconsIcon icon={Clock01Icon} className="mt-0.5 size-5 shrink-0" />
+          <p className="text-[0.95rem]">
+            {aboveThreshold && result.review!.threshold !== null
+              ? <>Au-delà de {francs(result.review!.threshold)}, l&apos;IPM valide le bon avant que vous puissiez l&apos;utiliser.</>
+              : <>L&apos;IPM vérifie ce bon avant que vous puissiez l&apos;utiliser.</>}
+            {" "}Vous serez prévenu par SMS.
+          </p>
+        </div>
+      )}
+
+      {refusals.length === 0 && !failure && !hold && result.decision.allowed && result.remainingMonthly !== null && (
         <p className="mt-4 text-center text-sm text-ink-2">
           Après ce bon, il restera {francs(Math.max(0, result.remainingMonthly - result.decision.split.insurerShare))} de prise en charge ce mois-ci.
         </p>
       )}
 
-      <Button onClick={onSubmit} disabled={!result.decision.allowed || submitting} className="mt-auto h-14 rounded-2xl text-lg font-semibold">
-        {hold ? "Envoyer pour validation" : "Valider le bon"}
+      <Button
+        onClick={onSubmit}
+        disabled={!result.decision.allowed || failure?.kind === "refused" || submitting}
+        aria-busy={submitting}
+        className="mt-auto h-14 rounded-2xl text-lg font-semibold"
+      >
+        {submitting && <HugeiconsIcon icon={Loading03Icon} className="size-5 animate-spin" />}
+        {submitting
+          ? "Envoi en cours…"
+          : failure?.kind === "retry"
+            ? "Réessayer"
+            : hold
+              ? "Envoyer pour validation"
+              : "Valider le bon"}
       </Button>
     </div>
   )

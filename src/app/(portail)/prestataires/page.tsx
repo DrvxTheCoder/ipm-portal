@@ -8,7 +8,7 @@ import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
 
 /**
- * Où me soigner — only agréé, active providers: a participant should never
+ * Prestataires — only agréé, active providers: a participant should never
  * pick somewhere their bon will be refused. The schema stores an address, not
  * coordinates, so directions hand the address to the phone's map app.
  */

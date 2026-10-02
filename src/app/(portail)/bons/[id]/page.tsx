@@ -1,9 +1,10 @@
 "use client"
 
-import { useParams, useRouter } from "next/navigation"
-import { useState } from "react"
+import Link from "next/link"
+import { useParams } from "next/navigation"
+import { useEffect, useState } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
-import { Cancel01Icon, Loading03Icon, Share08Icon } from "@hugeicons/core-free-icons"
+import { Add01Icon, Alert02Icon, Cancel01Icon, Loading03Icon, Share08Icon } from "@hugeicons/core-free-icons"
 import { toast } from "sonner"
 import { PageHeader } from "@/components/portal/app-shell"
 import { Badge } from "@/components/ui/badge"
@@ -11,24 +12,33 @@ import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Qr, verifyUrl } from "@/components/portal/qr"
 import { SplitBar } from "@/components/portal/split-bar"
+import { ReceiptImage } from "@/components/portal/receipt-image"
 import { STATUS_META, VOUCHER_TYPE_META } from "@/components/portal/meta"
 import { useStore } from "@/lib/store"
 import { francs, grouped, longDate } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { shareVoucherImage } from "@/lib/voucher-image"
+import { ApiError, NETWORK_MESSAGE } from "@/lib/api"
 
 const CANCEL_REASONS = ["Je n'en ai plus besoin", "Erreur sur le montant", "Mauvais prestataire", "Autre raison"]
 
 export default function BonDetailPage() {
   const { id } = useParams<{ id: string }>()
-  const router = useRouter()
-  const { db, cancel } = useStore()
+  const { db, cancel, markRead } = useStore()
   const [receiptOpen, setReceiptOpen] = useState(false)
   const [cancelOpen, setCancelOpen] = useState(false)
   const [reason, setReason] = useState(CANCEL_REASONS[0])
+  const [cancelling, setCancelling] = useState(false)
+  const [cancelError, setCancelError] = useState<string | null>(null)
   const [sharing, setSharing] = useState(false)
 
   const voucher = db.vouchers.find((v) => v.id === id)
+
+  // Seen: its notifications (validé / refusé) are read. Runs again when a new
+  // one arrives while the page is open.
+  useEffect(() => {
+    if (voucher) markRead(voucher.id)
+  }, [voucher, markRead])
   if (!voucher) {
     return (
       <div>
@@ -38,12 +48,29 @@ export default function BonDetailPage() {
     )
   }
 
-  const provider = db.providers.find((p) => p.id === voucher.providerId)!
+  // The snapshot lists accredited providers only; an older bon may name another.
+  const provider = db.providers.find((p) => p.id === voucher.providerId)
+  const providerLabel = provider?.name ?? "Prestataire"
   const lines = db.voucherLines.filter((l) => l.voucherId === voucher.id)
   const status = STATUS_META[voucher.status]
   const type = VOUCHER_TYPE_META[voucher.type]
   const usable = voucher.status === "ISSUED"
   const cancellable = voucher.status === "ISSUED" || voucher.status === "PENDING_REVIEW"
+
+  async function confirmCancel() {
+    if (!voucher || cancelling) return
+    setCancelling(true)
+    setCancelError(null)
+    try {
+      await cancel(voucher.id, reason)
+      setCancelOpen(false)
+      toast.success("Bon annulé")
+    } catch (error) {
+      setCancelError(error instanceof ApiError ? error.message : NETWORK_MESSAGE)
+    } finally {
+      setCancelling(false)
+    }
+  }
 
   async function share() {
     if (!voucher) return
@@ -58,8 +85,8 @@ export default function BonDetailPage() {
         memberShare: voucher.memberShare,
         appliedRate: voucher.appliedRate,
         totalAmount: voucher.totalAmount,
-        providerName: provider.name,
-        providerAddress: provider.address ?? null,
+        providerName: providerLabel,
+        providerAddress: provider?.address ?? null,
         expiryDate: voucher.expiryDate,
       })
       if (outcome === "downloaded") toast.success("Image du bon enregistrée")
@@ -117,10 +144,26 @@ export default function BonDetailPage() {
           </div>
         </section>
 
+        {voucher.status === "REJECTED" && (
+          <section role="note" className="mt-4 rounded-3xl bg-red-tint p-5 text-red">
+            <p className="flex items-center gap-2 font-semibold">
+              <HugeiconsIcon icon={Alert02Icon} className="size-5" />
+              Motif du refus
+            </p>
+            <p className="mt-1.5 text-[0.95rem]">{voucher.reviewReason ?? "L'IPM n'a pas donné de motif. Appelez-la pour en savoir plus."}</p>
+            <Link
+              href={voucher.dependentId ? `/bons/nouveau?pour=${encodeURIComponent(voucher.dependentId)}` : "/bons/nouveau"}
+              className="mt-4 flex h-12 items-center justify-center gap-2 rounded-2xl bg-teal font-semibold text-white"
+            >
+              <HugeiconsIcon icon={Add01Icon} className="size-5" /> Créer un nouveau bon
+            </Link>
+          </section>
+        )}
+
         <section className="mt-4 rounded-3xl bg-surface p-5 ring-1 ring-line">
           <dl className="space-y-3 text-[0.95rem]">
-            <Row label="Prestataire" value={provider.name} />
-            <Row label="Adresse" value={provider.address ?? "—"} />
+            <Row label="Prestataire" value={providerLabel} />
+            <Row label="Adresse" value={provider?.address ?? "—"} />
             <Row label="Créé le" value={longDate(voucher.issueDate)} />
             <Row label="Valable jusqu'au" value={longDate(voucher.expiryDate)} />
             <Row label="Créé depuis" value={voucher.origin === "PORTAL" ? "Mon espace" : "Guichet IPM"} />
@@ -149,8 +192,7 @@ export default function BonDetailPage() {
 
           {voucher.receiptUrl && (
             <button type="button" onClick={() => setReceiptOpen(true)} className="mt-4 flex w-full items-center gap-3 rounded-2xl bg-sunken p-3 text-left">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={voucher.receiptUrl} alt="" className="size-14 rounded-lg object-cover ring-1 ring-line" />
+              <ReceiptImage src={voucher.receiptUrl} alt="" className="size-14 shrink-0 rounded-lg object-cover ring-1 ring-line" />
               <span className="font-medium text-teal">Voir la photo du reçu</span>
             </button>
           )}
@@ -168,12 +210,18 @@ export default function BonDetailPage() {
           <DialogHeader>
             <DialogTitle>Reçu joint</DialogTitle>
           </DialogHeader>
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          {voucher.receiptUrl && <img src={voucher.receiptUrl} alt="Reçu" className="max-h-[70dvh] w-full rounded-xl object-contain" />}
+          <ReceiptImage src={voucher.receiptUrl} alt="Reçu" className="max-h-[70dvh] min-h-40 w-full rounded-xl object-contain" />
         </DialogContent>
       </Dialog>
 
-      <Dialog open={cancelOpen} onOpenChange={setCancelOpen}>
+      <Dialog
+        open={cancelOpen}
+        onOpenChange={(open) => {
+          if (cancelling) return
+          setCancelOpen(open)
+          setCancelError(null)
+        }}
+      >
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>Annuler le bon {voucher.number} ?</DialogTitle>
@@ -184,6 +232,7 @@ export default function BonDetailPage() {
               <button
                 key={r}
                 type="button"
+                disabled={cancelling}
                 onClick={() => setReason(r)}
                 className={cn("rounded-xl p-3 text-left ring-1", reason === r ? "bg-mint-wash ring-teal" : "ring-line")}
               >
@@ -191,19 +240,14 @@ export default function BonDetailPage() {
               </button>
             ))}
           </div>
+          {cancelError && (
+            <p role="alert" className="rounded-xl bg-red-tint p-3 text-[0.95rem] text-red">{cancelError}</p>
+          )}
           <DialogFooter>
-            <Button variant="outline" onClick={() => setCancelOpen(false)} className="h-11">Garder le bon</Button>
-            <Button
-              variant="destructive"
-              className="h-11"
-              onClick={() => {
-                cancel(voucher.id, reason)
-                setCancelOpen(false)
-                toast.success("Bon annulé")
-                router.push("/bons")
-              }}
-            >
-              Annuler le bon
+            <Button variant="outline" disabled={cancelling} onClick={() => setCancelOpen(false)} className="h-11">Garder le bon</Button>
+            <Button variant="destructive" className="h-11" disabled={cancelling} aria-busy={cancelling} onClick={() => void confirmCancel()}>
+              {cancelling && <HugeiconsIcon icon={Loading03Icon} className="size-4 animate-spin" />}
+              {cancelling ? "Annulation…" : "Annuler le bon"}
             </Button>
           </DialogFooter>
         </DialogContent>

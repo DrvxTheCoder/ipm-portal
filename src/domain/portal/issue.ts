@@ -1,61 +1,43 @@
 import type {
+  Db,
   IpmBeneficiaryType,
+  IpmReviewFlag,
   IpmVoucher,
-  IpmVoucherEntryMode,
-  IpmVoucherLine,
   IpmVoucherType,
+  PortalBooking,
+  ResolvedCeiling,
+  VoucherDraft,
 } from "@/lib/schema"
-import type { Db } from "@/lib/mock-data"
-import { VOUCHER_TYPE_BOOKING } from "@/lib/mock-data"
-import {
-  decideIssuance,
-  expiryFor,
-  formatVoucherNumber,
-  type IssuanceDecision,
-  type IssuanceFacts,
-} from "@/domain/ipm/issuance"
+import { decideIssuance, type IssuanceDecision, type IssuanceFacts } from "@/domain/ipm/issuance"
 import { lineTotal } from "@/domain/ipm/settlement"
-import { tryResolveRate, type RateRow, type ResolvedRate } from "@/domain/ipm/rates"
 import { decideReview, type ReviewDecision } from "@/domain/portal/review"
-import { beneficiaryRef } from "@/domain/portal/refs"
 
 /**
- * Émission d'un bon depuis le portail.
+ * Aperçu d'un bon, in the browser, for instant feedback while the participant
+ * fills the form.
  *
- * The same `decideIssuance` the back office runs — copied verbatim from
- * senexus-multiapp — then the portal's own review policy on top. In the real
- * module this is a server action inside a transaction; here it is a pure
- * function over the in-memory database, so the rules are identical and only
- * the storage differs.
+ * **The server decides.** `POST /api/portail/vouchers` runs the same
+ * `decideIssuance` and `decideReview` against the real ledger and numbers the
+ * bon; this preview mirrors its rules over the snapshot so the summary rarely
+ * disagrees with it, and when it does, the server's answer is the one shown.
  *
- * One deliberate departure from `settlement.ts`, which says "the voucher total
- * is never entered by hand": on the portal it may be. When the participant
- * enters lines, the total is their sum; when they only have the receipt total,
- * that total stands and the lines are completed later from the invoice. That
- * is the decision taken to get rid of blank bons without asking more than the
- * participant can give.
+ * The rules mirrored from multiapp (`src/server/portal/vouchers.ts`):
+ *   - priced lines win; with none, `total` is the amount;
+ *   - taux and plafonds are the server's, resolved in `Db.ceilings`
+ *     (participant > employer > formule, field by field), never re-derived;
+ *   - refusals come from `decideIssuance`;
+ *   - any warning holds the bon, flagged `ISSUANCE_WARNING`;
+ *   - otherwise `decideReview` decides whether it waits for the gestionnaire.
  */
 
-export type DraftLine = { label: string; quantity: number; unitPrice: number }
-
-export type VoucherDraft = {
-  type: IpmVoucherType
-  /** Null when the participant is the beneficiary. */
-  dependentId: string | null
-  providerId: string
-  entryMode: IpmVoucherEntryMode
-  lines: DraftLine[]
-  /** Used when there are no priced lines. */
-  manualTotal: number | null
-  receiptUrl: string | null
-  receiptHash: string | null
-  ocrTotal: number | null
-}
+/** A draft as the form holds it: the request body minus its idempotency key. */
+export type DraftInput = Omit<VoucherDraft, "clientRequestId">
 
 export type Preview = {
   totalAmount: number
-  rate: ResolvedRate | null
+  rate: ResolvedCeiling | null
   decision: IssuanceDecision
+  /** Null when refused. `hold` already includes a warning hold. */
   review: ReviewDecision | null
   /** Left under the monthly ceiling *before* this bon, insurer share. */
   remainingMonthly: number | null
@@ -69,24 +51,26 @@ const LIVE: ReadonlySet<IpmVoucher["status"]> = new Set([
   "INVOICED",
 ])
 
-export function draftTotal(draft: Pick<VoucherDraft, "lines" | "manualTotal">): number {
-  const priced = draft.lines.filter((line) => line.unitPrice > 0 && line.quantity > 0)
+/** Same rule as the server's `draftLines`: a line counts when it has a label, a quantity and a price. */
+export function draftTotal(draft: Pick<DraftInput, "lines" | "total">): number {
+  const priced = draft.lines.filter((line) => line.label.trim() && line.unitPrice > 0 && line.quantity > 0)
   if (priced.length > 0) return lineTotal(priced)
-  return Math.max(0, Math.round(draft.manualTotal ?? 0))
+  return Math.max(0, Math.round(draft.total ?? 0))
 }
 
-function planRows(db: Db, planId: string): RateRow[] {
-  return db.planRates
-    .filter((row) => row.planId === planId)
-    .map((row) => ({
-      categoryId: row.categoryId,
-      beneficiaryType: row.beneficiaryType,
-      rate: row.rate,
-      ceilingPerAct: row.ceilingPerAct,
-      ceilingMonthly: row.ceilingMonthly,
-      ceilingAnnual: row.ceilingAnnual,
-      waitingPeriodDays: row.waitingPeriodDays,
-    }))
+/** The booking for a type of bon, or null when this IPM does not offer it. */
+export function bookingFor(db: Db, type: IpmVoucherType): PortalBooking | null {
+  return db.bookings.find((b) => b.type === type) ?? null
+}
+
+/** Accredited, active providers that may receive this type of bon. */
+export function eligibleProviders(db: Db, booking: PortalBooking) {
+  return db.providers.filter(
+    (p) =>
+      p.accredited &&
+      p.status === "ACTIVE" &&
+      (booking.specialtyIds.length === 0 || (p.specialtyId !== null && booking.specialtyIds.includes(p.specialtyId)))
+  )
 }
 
 export function contextFor(db: Db, memberId: string) {
@@ -100,21 +84,12 @@ export function beneficiaryTypeOf(db: Db, dependentId: string | null): IpmBenefi
   return db.dependents.find((d) => d.id === dependentId)!.relation
 }
 
-export function resolveFor(
-  db: Db,
-  memberId: string,
-  categoryId: string,
-  beneficiaryType: IpmBeneficiaryType
-): ResolvedRate | null {
-  const { employer } = contextFor(db, memberId)
-  const category = db.categories.find((c) => c.id === categoryId)!
-  return tryResolveRate({
-    categoryId,
-    categoryCode: category.code,
-    beneficiaryType,
-    employerRates: [],
-    planRates: planRows(db, employer.planId),
-  })
+/**
+ * Taux and plafonds in force for one category and beneficiary type of the
+ * family, as the server resolved them. Null: not covered.
+ */
+export function resolveFor(db: Db, categoryId: string, beneficiaryType: IpmBeneficiaryType): ResolvedCeiling | null {
+  return db.ceilings.find((c) => c.categoryId === categoryId && c.beneficiaryType === beneficiaryType) ?? null
 }
 
 /**
@@ -143,11 +118,16 @@ function sameDay(a: Date, b: Date) {
   return a.toDateString() === b.toDateString()
 }
 
-export function preview(db: Db, memberId: string, draft: VoucherDraft, on = new Date()): Preview {
+export function preview(
+  db: Db,
+  memberId: string,
+  booking: PortalBooking,
+  draft: DraftInput,
+  on = new Date()
+): Preview {
   const { member, employer } = contextFor(db, memberId)
-  const booking = VOUCHER_TYPE_BOOKING[draft.type]
   const beneficiaryType = beneficiaryTypeOf(db, draft.dependentId)
-  const rate = resolveFor(db, memberId, booking.categoryId, beneficiaryType)
+  const rate = resolveFor(db, booking.categoryId, beneficiaryType)
   const consumed = consumedFor(db, memberId, booking.categoryId, on)
   const totalAmount = draftTotal(draft)
 
@@ -218,7 +198,7 @@ export function preview(db: Db, memberId: string, draft: VoucherDraft, on = new 
     .filter((v) => v.memberId === memberId && v.categoryId === booking.categoryId && LIVE.has(v.status))
     .map((v) => v.totalAmount)
 
-  const review = decision.allowed
+  const policy = decision.allowed
     ? decideReview({
         totalAmount,
         ceilingMonthly: rate?.ceilingMonthly ?? null,
@@ -240,6 +220,15 @@ export function preview(db: Db, memberId: string, draft: VoucherDraft, on = new 
       })
     : null
 
+  // A warning (late cotisations, lapsed convention) is not the participant's
+  // to override: the server holds the bon for a gestionnaire.
+  const warned = decision.warnings.length > 0
+  const review: ReviewDecision | null = policy && {
+    ...policy,
+    hold: policy.hold || warned,
+    flags: warned ? (["ISSUANCE_WARNING", ...policy.flags] satisfies IpmReviewFlag[]) : policy.flags,
+  }
+
   return {
     totalAmount,
     rate,
@@ -247,146 +236,5 @@ export function preview(db: Db, memberId: string, draft: VoucherDraft, on = new 
     review,
     remainingMonthly:
       rate?.ceilingMonthly != null ? Math.max(0, rate.ceilingMonthly - consumed.month) : null,
-  }
-}
-
-function token(): string {
-  const bytes = new Uint8Array(16)
-  crypto.getRandomValues(bytes)
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
-}
-
-export class PortalIssuanceError extends Error {}
-
-/**
- * Decided again here, against the database as it is now — the same reason the
- * module decides twice: the preview may be stale by the time the button is hit.
- */
-export function issue(
-  db: Db,
-  memberId: string,
-  portalAccountId: string,
-  draft: VoucherDraft,
-  on = new Date()
-): { db: Db; voucher: IpmVoucher } {
-  if (!draft.receiptUrl) {
-    throw new PortalIssuanceError("La photo du reçu est obligatoire.")
-  }
-  const result = preview(db, memberId, draft, on)
-  if (!result.decision.allowed) {
-    throw new PortalIssuanceError(result.decision.refusals.map((r) => r.message).join(" "))
-  }
-  if (result.totalAmount <= 0) {
-    throw new PortalIssuanceError("Indiquez le montant du reçu.")
-  }
-
-  const { split } = result.decision
-  const review = result.review!
-  const booking = VOUCHER_TYPE_BOOKING[draft.type]
-  const dependent = draft.dependentId ? db.dependents.find((d) => d.id === draft.dependentId)! : null
-  const member = db.members.find((m) => m.id === memberId)!
-  const person = db.persons.find((p) => p.id === (dependent?.personId ?? member.personId))!
-
-  const sequence = db.sequences[draft.type]
-  const id = `v_${token().slice(0, 12)}`
-  const nowIso = on.toISOString()
-
-  const voucher: IpmVoucher = {
-    id,
-    firmId: db.firmId,
-    number: formatVoucherNumber(draft.type, sequence),
-    type: draft.type,
-    memberId,
-    dependentId: dependent?.id ?? null,
-    beneficiaryType: dependent ? dependent.relation : "MEMBER",
-    beneficiaryName: `${person.firstName} ${person.lastName}`.toUpperCase(),
-    providerId: draft.providerId,
-    serviceTypeId: booking.serviceTypeId,
-    categoryId: booking.categoryId,
-    issueDate: nowIso,
-    expiryDate: expiryFor(draft.type, on).toISOString(),
-    status: review.hold ? "PENDING_REVIEW" : "ISSUED",
-    totalAmount: split.totalAmount,
-    insurerShare: split.insurerShare,
-    memberShare: split.memberShare,
-    appliedRate: result.rate!.rate,
-    rateSource: `${result.rate!.source}:${result.rate!.matchedOn}`,
-    qrToken: token(),
-    issuedById: null,
-    settledAt: null,
-    cancelledAt: null,
-    cancelReason: null,
-    origin: "PORTAL",
-    issuedByPortalAccountId: portalAccountId,
-    entryMode: draft.entryMode,
-    receiptUrl: draft.receiptUrl,
-    receiptHash: draft.receiptHash,
-    ocrTotal: draft.ocrTotal,
-    reviewFlags: review.flags,
-    reviewedById: null,
-    reviewedAt: null,
-    reviewReason: null,
-    createdAt: nowIso,
-  }
-
-  const lines: IpmVoucherLine[] = draft.lines
-    .filter((line) => line.label.trim() && line.unitPrice > 0)
-    .map((line, index) => ({
-      id: `${id}_l${index + 1}`,
-      firmId: db.firmId,
-      voucherId: id,
-      medicalActId: null,
-      label: line.label.trim(),
-      quantity: line.quantity,
-      unitPrice: line.unitPrice,
-      amount: Math.round(line.quantity * line.unitPrice),
-    }))
-
-  // A held bon reserves its share too — otherwise several pending bons could
-  // together exceed the ceiling the moment they are all validated.
-  const consumption = {
-    id: `c_${id}`,
-    firmId: db.firmId,
-    beneficiaryRef: beneficiaryRef(memberId, voucher.dependentId),
-    memberId,
-    categoryId: booking.categoryId,
-    periodYear: on.getFullYear(),
-    periodMonth: on.getMonth() + 1,
-    voucherId: id,
-    amount: split.totalAmount,
-    insurerShare: split.insurerShare,
-  }
-
-  return {
-    voucher,
-    db: {
-      ...db,
-      vouchers: [voucher, ...db.vouchers],
-      voucherLines: [...db.voucherLines, ...lines],
-      consumptions: [...db.consumptions, consumption],
-      sequences: { ...db.sequences, [draft.type]: sequence + 1 },
-    },
-  }
-}
-
-/**
- * The participant may cancel their own bon while nobody has acted on it yet —
- * issued or still pending. Never edited, never deleted: the QR token rotates
- * so a printed copy stops verifying, and the consumption is released.
- */
-export function cancel(db: Db, voucherId: string, reason: string, on = new Date()): Db {
-  const voucher = db.vouchers.find((v) => v.id === voucherId)
-  if (!voucher) throw new PortalIssuanceError("Bon introuvable.")
-  if (voucher.status !== "ISSUED" && voucher.status !== "PENDING_REVIEW") {
-    throw new PortalIssuanceError("Ce bon a déjà été utilisé et ne peut plus être annulé.")
-  }
-  return {
-    ...db,
-    vouchers: db.vouchers.map((v) =>
-      v.id === voucherId
-        ? { ...v, status: "CANCELLED", cancelledAt: on.toISOString(), cancelReason: reason, qrToken: token() }
-        : v
-    ),
-    consumptions: db.consumptions.filter((c) => c.voucherId !== voucherId),
   }
 }

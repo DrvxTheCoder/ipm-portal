@@ -137,7 +137,7 @@ function Recto({
 }: {
   holder: FamilyMember
   employerName: string
-  planName: string
+  planName: string | null
   coverage: CardCoverage[]
   qrValue: string
   uid: string
@@ -148,7 +148,7 @@ function Recto({
   const total = labelWidth + 1.6 + emWidth(holder.matricule) * 5
   const labelX = CENTRE - total / 2
   const employer = clamp(employerName, 40)
-  const formule = `Formule ${planName}`
+  const formule = planName ? `Formule ${planName}` : "Tarif employeur"
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="size-full -mt-3" fontFamily={FONT} fontWeight={700} role="img" aria-label={`Carte IPM de ${holder.name}`}>
@@ -358,7 +358,7 @@ export function IpmCard({
 }: {
   holder: FamilyMember
   dependents: FamilyMember[]
-  planName: string
+  planName: string | null
   employerName: string
   coverage: CardCoverage[]
   qrValue: string

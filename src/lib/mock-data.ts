@@ -1,4 +1,5 @@
 import type {
+  Db,
   Dependent,
   IpmAgreement,
   IpmConsumption,
@@ -17,6 +18,8 @@ import type {
   Member,
   Person,
   PortalAccount,
+  PortalBooking,
+  ResolvedCeiling,
 } from "@/lib/schema"
 import { split } from "@/domain/ipm/settlement"
 import { formatVoucherNumber, expiryFor, LEGACY_MAXIMA } from "@/domain/ipm/issuance"
@@ -24,45 +27,22 @@ import { beneficiaryRef } from "@/domain/portal/refs"
 import { sampleReceipt } from "@/lib/sample-receipt"
 
 /**
- * The whole prototype database. One participant, her family, the referentiel
- * and three months of history — enough for every screen to have something
- * true to say.
+ * The prototype's database: one participant, her family, the referentiel and
+ * three months of history.
+ *
+ * **Tests only.** At runtime the portal reads multiapp's `/api/portail/snapshot`
+ * (see `src/lib/store.tsx`); nothing outside `tests/` may import this file.
  *
  * All names are invented. Providers are real Dakar institutions or plausible
- * ones, so the demo reads as local.
+ * ones, so the fixture reads as local.
  */
-export type Db = {
-  firmId: string
-  persons: Person[]
-  categories: IpmServiceCategory[]
-  serviceTypes: IpmServiceType[]
-  specialties: IpmProviderSpecialty[]
-  plans: IpmPlan[]
-  planRates: IpmPlanRate[]
-  employers: IpmEmployer[]
-  members: Member[]
-  dependents: Dependent[]
-  cards: IpmMemberCard[]
-  providers: IpmProvider[]
-  agreements: IpmAgreement[]
-  vouchers: IpmVoucher[]
-  voucherLines: IpmVoucherLine[]
-  consumptions: IpmConsumption[]
-  portalAccounts: PortalAccount[]
-  settings: IpmPortalSettings
-  /** Next number per voucher type — IpmSequence, flattened. */
-  sequences: Record<IpmVoucherType, number>
-}
+export type { Db } from "@/lib/schema"
 
 export const FIRM_ID = "firm_ipm_tawfeikh"
 const HOLDING_ID = "holding_senexus"
 
-/**
- * Which service type and category a bon of each type books against. In the
- * back office the operator picks the service type; on the portal the type of
- * bon decides it, because a participant should not have to know the referentiel.
- */
-export const VOUCHER_TYPE_BOOKING: Record<
+/** What a bon of each type books against — `Db.bookings` in this fixture. */
+const VOUCHER_TYPE_BOOKING: Record<
   IpmVoucherType,
   { serviceTypeId: string; categoryId: string }
 > = {
@@ -73,7 +53,7 @@ export const VOUCHER_TYPE_BOOKING: Record<
 }
 
 /** Provider specialties that can receive each type of bon. */
-export const VOUCHER_TYPE_SPECIALTIES: Record<IpmVoucherType, string[]> = {
+const VOUCHER_TYPE_SPECIALTIES: Record<IpmVoucherType, string[]> = {
   PHARMACY: ["spec_pharma"],
   OPTICAL: ["spec_optique"],
   GUARANTEE: ["spec_clinique", "spec_labo", "spec_generaliste"],
@@ -332,6 +312,7 @@ export function seed(): Db {
     specialties,
     plans,
     planRates,
+    employerRates: [],
     employers,
     members,
     dependents,
@@ -351,6 +332,33 @@ export function seed(): Db {
       unusualAmountMultiple: 3,
       ocrMismatchTolerance: 0.15,
     },
+    // What the server resolves: here only the formule's rows, for every
+    // beneficiary type the family has.
+    ceilings: (["MEMBER", ...new Set(dependents.map((d) => d.relation))] as const).flatMap((beneficiaryType) =>
+      planRates.map(
+        (row): ResolvedCeiling => ({
+          categoryId: row.categoryId,
+          beneficiaryType,
+          rate: row.rate,
+          ceilingPerAct: row.ceilingPerAct,
+          ceilingMonthly: row.ceilingMonthly,
+          ceilingAnnual: row.ceilingAnnual,
+          waitingPeriodDays: row.waitingPeriodDays,
+          source: {
+            perAct: row.ceilingPerAct === null ? null : "PLAN",
+            monthly: row.ceilingMonthly === null ? null : "PLAN",
+            annual: row.ceilingAnnual === null ? null : "PLAN",
+          },
+        })
+      )
+    ),
+    bookings: (Object.keys(VOUCHER_TYPE_BOOKING) as IpmVoucherType[]).map(
+      (type): PortalBooking => ({
+        type,
+        ...VOUCHER_TYPE_BOOKING[type],
+        specialtyIds: VOUCHER_TYPE_SPECIALTIES[type],
+      })
+    ),
     sequences,
   }
 }

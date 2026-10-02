@@ -8,7 +8,7 @@ import { Home09Icon, Ticket02Icon, UserGroupIcon, UserCircleIcon } from "@hugeic
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
 import { useOnline } from "@/lib/pwa"
-import { OfflineBanner } from "@/components/portal/offline"
+import { LoadFailed, OfflineBanner, StaleBanner } from "@/components/portal/offline"
 
 const NAV = [
   { href: "/", label: "Accueil", icon: Home09Icon },
@@ -19,7 +19,7 @@ const NAV = [
 
 /** Phone-width column, session guard, four labelled tabs. */
 export function AppShell({ children }: { children: ReactNode }) {
-  const { ready, session } = useStore()
+  const { ready, loaded, session, stale, error, refreshing, refresh } = useStore()
   const pathname = usePathname()
   const router = useRouter()
   // The tabs show only on the four tab screens. Everything else (a bon, the
@@ -35,6 +35,15 @@ export function AppShell({ children }: { children: ReactNode }) {
     return <div className="mx-auto min-h-dvh max-w-md bg-paper" aria-busy />
   }
 
+  // Pages read the snapshot without guards: render them only once there is one.
+  if (!loaded) {
+    return (
+      <div className="mx-auto min-h-dvh max-w-md bg-paper" aria-busy={!error}>
+        {error && <LoadFailed message={error} refreshing={refreshing} onRetry={() => void refresh()} />}
+      </div>
+    )
+  }
+
   return (
     <div className="mx-auto min-h-dvh max-w-md bg-paper md:my-6 md:min-h-[calc(100dvh-3rem)] md:overflow-hidden md:rounded-[2.2rem] md:border md:border-line md:shadow-[0_30px_80px_-40px_rgba(13,42,48,.45)]">
       <main
@@ -47,6 +56,9 @@ export function AppShell({ children }: { children: ReactNode }) {
       </main>
       {/* The creation flow has its own, blocking notice. */}
       {!online && !pathname.startsWith("/bons/nouveau") && <OfflineBanner aboveNav={showNav} />}
+      {online && stale && !pathname.startsWith("/bons/nouveau") && (
+        <StaleBanner aboveNav={showNav} refreshing={refreshing} onRetry={() => void refresh()} />
+      )}
       {showNav && (
         <nav
           aria-label="Navigation principale"

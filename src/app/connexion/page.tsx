@@ -4,16 +4,22 @@ import Image from "next/image"
 import { useRouter } from "next/navigation"
 import { useEffect, useRef, useState } from "react"
 import { AnimatePresence, motion } from "motion/react"
+import { HugeiconsIcon } from "@hugeicons/react"
+import { Loading03Icon } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
 import { BackLink } from "@/components/portal/app-shell"
 import { useStore } from "@/lib/store"
+import { ApiError, NETWORK_MESSAGE } from "@/lib/api"
 
 /**
  * Connexion par numéro de téléphone et code SMS — no password to forget,
- * nothing to type but digits. PortalAccount.phone is Person.phone at
- * activation. In the prototype the code is shown on screen.
+ * nothing to type but digits. The phone and the code go to the server
+ * together (`POST /api/portail/session`), which says whether they match.
+ *
+ * In the demo every account signs in with multiapp's DEMO_OTP; set
+ * NEXT_PUBLIC_DEMO_CODE to the same value to show it on screen.
  */
-const DEMO_CODE = "2026"
+const DEMO_CODE = process.env.NEXT_PUBLIC_DEMO_CODE || null
 
 function formatPhone(digits: string) {
   return digits.replace(/(\d{2})(\d{0,3})(\d{0,2})(\d{0,2})/, (_, a, b, c, d) => [a, b, c, d].filter(Boolean).join(" "))
@@ -26,6 +32,7 @@ export default function ConnexionPage() {
   const [phone, setPhone] = useState("")
   const [code, setCode] = useState("")
   const [error, setError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
   const codeRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -47,20 +54,22 @@ export default function ConnexionPage() {
     setStep("code")
   }
 
-  function verify(value: string) {
-    if (value.length < 4) return
-    if (value !== DEMO_CODE) {
-      setError("Ce code ne correspond pas. Vérifiez le SMS reçu.")
-      setCode("")
-      return
+  async function verify(value: string) {
+    if (value.length < 4 || submitting) return
+    setSubmitting(true)
+    setError(null)
+    try {
+      await signIn(digits, value)
+      router.replace("/")
+    } catch (failure) {
+      setError(failure instanceof ApiError ? failure.message : NETWORK_MESSAGE)
+      // A wrong code is retyped; anything else (network, too many attempts)
+      // keeps it, so "Valider" can simply be pressed again.
+      if (failure instanceof ApiError && failure.status === 401) setCode("")
+      codeRef.current?.focus()
+    } finally {
+      setSubmitting(false)
     }
-    if (!signIn(digits)) {
-      setError("Aucun compte IPM n'est lié à ce numéro. Contactez votre gestionnaire.")
-      setStep("phone")
-      setCode("")
-      return
-    }
-    router.replace("/")
   }
 
   return (
@@ -111,9 +120,6 @@ export default function ConnexionPage() {
               <Button onClick={sendCode} className="h-14 w-full rounded-2xl text-lg font-semibold">
                 Recevoir le code par SMS
               </Button>
-              <p className="text-center text-sm text-ink-3">
-                Démo : <button className="font-semibold text-teal underline-offset-2 hover:underline" onClick={() => setPhone("771234567")}>77 123 45 67</button>
-              </p>
             </div>
           </motion.div>
         ) : (
@@ -139,11 +145,12 @@ export default function ConnexionPage() {
                 autoComplete="one-time-code"
                 maxLength={4}
                 value={code}
+                disabled={submitting}
                 onChange={(e) => {
                   const v = e.target.value.replace(/\D/g, "").slice(0, 4)
                   setCode(v)
                   setError(null)
-                  if (v.length === 4) verify(v)
+                  if (v.length === 4) void verify(v)
                 }}
                 className="absolute inset-0 opacity-0"
               />
@@ -162,9 +169,21 @@ export default function ConnexionPage() {
             </div>
             {error && <p className="mt-3 text-sm font-medium text-red">{error}</p>}
 
-            <p className="mt-auto pt-10 text-center text-sm text-ink-3">
-              Démo : le code est <span className="figure text-base font-semibold text-teal">{DEMO_CODE}</span>
-            </p>
+            <div className="mt-auto space-y-3 pt-10">
+              <Button
+                onClick={() => void verify(code)}
+                disabled={code.length < 4 || submitting}
+                className="h-14 w-full rounded-2xl text-lg font-semibold"
+              >
+                {submitting && <HugeiconsIcon icon={Loading03Icon} className="size-5 animate-spin" />}
+                {submitting ? "Vérification…" : "Valider"}
+              </Button>
+              {DEMO_CODE && (
+                <p className="text-center text-sm text-ink-3">
+                  Démo : le code est <span className="figure text-base font-semibold text-teal">{DEMO_CODE}</span>
+                </p>
+              )}
+            </div>
           </motion.div>
         )}
       </AnimatePresence>

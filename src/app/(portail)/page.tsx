@@ -5,7 +5,9 @@ import { useMemo, useState } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
   Add01Icon,
+  Alert02Icon,
   ArrowRight01Icon,
+  CheckmarkCircle02Icon,
   ChartUpIcon,
   Clock01Icon,
   IdCardIcon,
@@ -15,18 +17,36 @@ import {
 import { Avatar } from "@/components/portal/avatar"
 import { Envelope } from "@/components/portal/envelope"
 import { VoucherRow } from "@/components/portal/voucher-row"
+import { VOUCHER_TYPE_META } from "@/components/portal/meta"
 import { useStore } from "@/lib/store"
 import { envelope, family, providerName, vouchersOf } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 import { useOnline } from "@/lib/pwa"
+import type { Db, IpmCeilingSource } from "@/lib/schema"
 
-const CATEGORIES = [
-  { id: "cat_pharma", tab: "Pharmacie", label: "Pharmacie" },
-  { id: "cat_hospi", tab: "Soins & hospi.", label: "Soins & hospitalisation" },
-  { id: "cat_optique", tab: "Optique", label: "Optique" },
-]
+type Category = { id: string; tab: string; label: string }
+/** `ceiling` null: covered without a cap, `remaining` is then this month's IPM share. */
+type Balance = Category & {
+  remaining: number
+  ceiling: number | null
+  period: "mois" | "an"
+  source: IpmCeilingSource | null
+  rate: number | null
+}
 
-type Balance = (typeof CATEGORIES)[number] & { remaining: number; ceiling: number; period: "mois" | "an" }
+/**
+ * The categories a participant can spend in: those the IPM's bookings point
+ * at, in booking order, named by the first type of bon that books there.
+ */
+function bookedCategories(db: Db): Category[] {
+  const seen = new Set<string>()
+  return db.bookings.flatMap((booking) => {
+    if (seen.has(booking.categoryId)) return []
+    seen.add(booking.categoryId)
+    const category = db.categories.find((c) => c.id === booking.categoryId)
+    return [{ id: booking.categoryId, tab: VOUCHER_TYPE_META[booking.type].short, label: category?.label ?? VOUCHER_TYPE_META[booking.type].short }]
+  })
+}
 
 const SHORTCUTS = [
   { href: "/carte", label: "Ma carte", icon: IdCardIcon },
@@ -36,25 +56,27 @@ const SHORTCUTS = [
 ]
 
 export default function HomePage() {
-  const { db, session } = useStore()
+  const { db, session, notifications } = useStore()
   const memberId = session!.memberId
   const people = useMemo(() => family(db, memberId), [db, memberId])
   const me = people[0]
 
   // One balance per category for the household: every bon, whoever it is for,
-  // draws on it. Glasses have a yearly ceiling, everything else a monthly one.
-  const balances = CATEGORIES.flatMap((c): Balance[] => {
+  // draws on it. The monthly ceiling when there is one, else the yearly one,
+  // else none at all. A category the family is not covered for has no tab.
+  const balances = bookedCategories(db).flatMap((c): Balance[] => {
     const env = envelope(db, memberId, c.id)
+    if (env.rate === null) return []
     if (env.remaining !== null && env.ceiling !== null) {
-      return [{ ...c, remaining: env.remaining, ceiling: env.ceiling, period: "mois" }]
+      return [{ ...c, remaining: env.remaining, ceiling: env.ceiling, period: "mois", source: env.source?.monthly ?? null, rate: env.rate }]
     }
     if (env.annualRemaining !== null && env.annualCeiling !== null) {
-      return [{ ...c, remaining: env.annualRemaining, ceiling: env.annualCeiling, period: "an" }]
+      return [{ ...c, remaining: env.annualRemaining, ceiling: env.annualCeiling, period: "an", source: env.source?.annual ?? null, rate: env.rate }]
     }
-    return []
+    return [{ ...c, remaining: env.consumed, ceiling: null, period: "mois", source: null, rate: env.rate }]
   })
-  const [tab, setTab] = useState(CATEGORIES[0].id)
-  const current = balances.find((b) => b.id === tab) ?? balances[0]
+  const [tab, setTab] = useState<string | null>(null)
+  const current: Balance | undefined = balances.find((b) => b.id === tab) ?? balances[0]
 
   const vouchers = vouchersOf(db, memberId)
   const pending = vouchers.filter((v) => v.status === "PENDING_REVIEW")
@@ -72,6 +94,36 @@ export default function HomePage() {
         </Link>
       </header>
 
+      {notifications.length > 0 && (
+        <ul className="mx-5 mt-5 space-y-2.5" aria-label="Notifications">
+          {notifications.map((n) => {
+            const approved = n.kind === "VOUCHER_APPROVED"
+            return (
+              <li key={n.id}>
+                <Link
+                  href={`/bons/${n.voucher.id}`}
+                  className={cn(
+                    "flex items-center gap-3 rounded-2xl p-3.5",
+                    approved ? "bg-mint text-teal-deep" : "bg-red-tint text-red"
+                  )}
+                >
+                  <HugeiconsIcon icon={approved ? CheckmarkCircle02Icon : Alert02Icon} className="size-6 shrink-0" />
+                  <span className="min-w-0 flex-1 text-[0.95rem]">
+                    <span className="block font-medium">
+                      {approved ? `Bon ${n.voucher.number} validé, prêt à utiliser` : `Bon ${n.voucher.number} refusé`}
+                    </span>
+                    {!approved && n.voucher.reviewReason && (
+                      <span className="mt-0.5 line-clamp-2 block text-sm">{n.voucher.reviewReason}</span>
+                    )}
+                  </span>
+                  <HugeiconsIcon icon={ArrowRight01Icon} className="size-5 shrink-0" />
+                </Link>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+
       {pending.length > 0 && (
         <Link
           href={`/bons/${pending[0].id}`}
@@ -86,45 +138,54 @@ export default function HomePage() {
       )}
 
       {/* envelope */}
-      <section className="mx-5 mt-5 rounded-2xl bg-surface p-5 ring-1 ring-line">
-        <div role="tablist" aria-label="Type de soins" className="mb-5 grid grid-cols-3 gap-1 rounded-full bg-sunken p-1">
-          {balances.map((b) => (
-            <button
-              key={b.id}
-              type="button"
-              role="tab"
-              aria-selected={b.id === current.id}
-              title={b.label}
-              onClick={() => setTab(b.id)}
-              className={cn(
-                "h-9 truncate rounded-full px-2 text-sm font-medium transition-colors",
-                b.id === current.id ? "bg-surface text-teal-deep shadow-sm" : "text-ink-2"
-              )}
-            >
-              {b.tab}
-            </button>
-          ))}
-        </div>
-        <div role="tabpanel">
-          <Envelope
-            personKey={current.id}
-            remaining={current.remaining}
-            ceiling={current.ceiling}
-            period={current.period}
-            label={`${current.label} `}
-          />
-        </div>
-        {people.length > 1 && (
-          <Link href="/famille" className="mt-4 flex items-center gap-3">
-            <span className="flex -space-x-2">
-              {people.map((person) => (
-                <Avatar key={person.key} person={person.person} rank={person.rank} className="size-8 text-sm ring-2 ring-surface" />
-              ))}
-            </span>
-            <span className="text-sm text-ink-2">Partagé avec votre famille</span>
-          </Link>
-        )}
-      </section>
+      {current && (
+        <section className="mx-5 mt-5 rounded-2xl bg-surface p-5 ring-1 ring-line">
+          <div
+            role="tablist"
+            aria-label="Type de soins"
+            className="mb-5 grid gap-1 rounded-full bg-sunken p-1"
+            style={{ gridTemplateColumns: `repeat(${balances.length}, minmax(0, 1fr))` }}
+          >
+            {balances.map((b) => (
+              <button
+                key={b.id}
+                type="button"
+                role="tab"
+                aria-selected={b.id === current.id}
+                title={b.label}
+                onClick={() => setTab(b.id)}
+                className={cn(
+                  "h-9 truncate rounded-full px-2 text-sm font-medium transition-colors",
+                  b.id === current.id ? "bg-surface text-teal-deep shadow-sm" : "text-ink-2"
+                )}
+              >
+                {b.tab}
+              </button>
+            ))}
+          </div>
+          <div role="tabpanel">
+            <Envelope
+              personKey={current.id}
+              remaining={current.remaining}
+              ceiling={current.ceiling}
+              period={current.period}
+              source={current.source}
+              rate={current.rate}
+              label={`${current.label} `}
+            />
+          </div>
+          {people.length > 1 && (
+            <Link href="/famille" className="mt-4 flex items-center gap-3">
+              <span className="flex -space-x-2">
+                {people.map((person) => (
+                  <Avatar key={person.key} person={person.person} rank={person.rank} className="size-8 text-sm ring-2 ring-surface" />
+                ))}
+              </span>
+              <span className="text-sm text-ink-2">Partagé avec votre famille</span>
+            </Link>
+          )}
+        </section>
+      )}
 
       {/* primary action */}
       <div className="mx-5 mt-5">

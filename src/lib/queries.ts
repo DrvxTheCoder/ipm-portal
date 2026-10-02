@@ -1,5 +1,4 @@
-import type { Db } from "@/lib/mock-data"
-import type { IpmVoucher, Person } from "@/lib/schema"
+import type { Db, IpmVoucher, Person } from "@/lib/schema"
 import { RELATION_LABELS, ageOn, isDependentCovered } from "@/domain/ipm/coverage"
 import { beneficiaryRef } from "@/domain/portal/refs"
 import { consumedFor, resolveFor } from "@/domain/portal/issue"
@@ -69,11 +68,13 @@ export function family(db: Db, memberId: string, on = new Date()): FamilyMember[
 
 /** The household's envelope for one category — one balance shared by the whole family. */
 export function envelope(db: Db, memberId: string, categoryId: string, on = new Date()) {
-  const rate = resolveFor(db, memberId, categoryId, "MEMBER")
+  const rate = resolveFor(db, categoryId, "MEMBER")
   const consumed = consumedFor(db, memberId, categoryId, on)
   const ceiling = rate?.ceilingMonthly ?? null
   return {
     rate: rate?.rate ?? null,
+    /** Who set each plafond: the formule, the employer, or the participant's own. */
+    source: rate?.source ?? null,
     ceiling,
     consumed: consumed.month,
     remaining: ceiling === null ? null : Math.max(0, ceiling - consumed.month),
@@ -92,7 +93,7 @@ export function usageOf(db: Db, memberId: string, ref: string, on = new Date()) 
   return [...db.categories]
     .sort((a, b) => a.sortOrder - b.sortOrder)
     .map((category) => {
-      const rate = resolveFor(db, memberId, category.id, "MEMBER")
+      const rate = resolveFor(db, category.id, "MEMBER")
       const period: "mois" | "an" = rate?.ceilingMonthly == null && rate?.ceilingAnnual != null ? "an" : "mois"
       let used = 0
       for (const row of db.consumptions) {
