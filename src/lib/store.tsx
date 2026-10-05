@@ -51,7 +51,8 @@ type Store = {
   signOut: () => void
   refresh: () => Promise<void>
   /** Issues the bon on the server and returns it as written. Throws `ApiError`. */
-  issue: (draft: VoucherDraft, receipt: Blob) => Promise<IpmVoucher>
+  /** `receipt` null: the participant skipped the photo, no `receipt` part is sent. */
+  issue: (draft: VoucherDraft, receipt: Blob | null) => Promise<IpmVoucher>
   /** Throws `ApiError`. */
   cancel: (voucherId: string, reason: string) => Promise<IpmVoucher>
   /** Marks a bon's notifications read, if it has any. */
@@ -263,11 +264,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const issue = useCallback(
-    async (draft: VoucherDraft, receipt: Blob) => {
+    async (draft: VoucherDraft, receipt: Blob | null) => {
       const form = new FormData()
       form.append("draft", JSON.stringify(draft))
-      const extension = receipt.type === "image/png" ? "png" : receipt.type === "image/webp" ? "webp" : "jpg"
-      form.append("receipt", receipt, `recu.${extension}`)
+      if (receipt) {
+        const extension = receipt.type === "image/png" ? "png" : receipt.type === "image/webp" ? "webp" : "jpg"
+        form.append("receipt", receipt, `recu.${extension}`)
+      }
       const created = await api<CreateVoucherResponse>("/vouchers", { method: "POST", form })
       setDb((current) => withVoucher(current, created))
       void refresh()

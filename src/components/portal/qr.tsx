@@ -26,4 +26,4 @@ export function Qr({ value, className }: { value: string; className?: string }) 
   )
 }
 
-export const verifyUrl = (token: string) => `https://portail.ipmtawfeikh.com/v/${token}`
+export const verifyUrl = (token: string) => new URL(`/v/${token}`, process.env.NEXT_PUBLIC_URL).toString()

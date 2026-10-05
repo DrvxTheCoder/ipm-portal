@@ -1,10 +1,12 @@
 "use client"
 
+import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { useEffect, type ReactNode } from "react"
+import { useEffect, useState, type ReactNode } from "react"
+import { motion } from "motion/react"
 import { HugeiconsIcon } from "@hugeicons/react"
-import { Home09Icon, Ticket02Icon, UserGroupIcon, UserCircleIcon } from "@hugeicons/core-free-icons"
+import { Home09Icon, Loading03Icon, Ticket02Icon, UserGroupIcon, UserCircleIcon } from "@hugeicons/core-free-icons"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
 import { useOnline } from "@/lib/pwa"
@@ -17,6 +19,43 @@ const NAV = [
   { href: "/profil", label: "Profil", icon: UserCircleIcon },
 ] as const
 
+/** Shortest time the loading screen stays up, so it never just flashes. */
+const SPLASH_MIN_MS = 600
+
+/** True while `active`, and until at least `ms` after it became true. */
+function useAtLeast(active: boolean, ms: number): boolean {
+  const [since, setSince] = useState<number | null>(null)
+  useEffect(() => {
+    if (active) {
+      setSince((s) => s ?? Date.now())
+      return
+    }
+    if (since === null) return
+    const timer = setTimeout(() => setSince(null), Math.max(0, since + ms - Date.now()))
+    return () => clearTimeout(timer)
+  }, [active, ms, since])
+  return active || (since !== null && Date.now() - since < ms)
+}
+
+/** Shown while the first snapshot loads, typically right after signing in. */
+function Splash() {
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ duration: 0.3 }}
+      role="status"
+      aria-live="polite"
+      className="flex min-h-dvh flex-col items-center justify-center gap-6 px-6"
+    >
+      <Image src="/brand/ipm-tawfeikh.png" alt="IPM Tawfeikh" width={590} height={371} priority className="h-auto w-40" />
+      {/* Reduced motion: no spinner, the line only fades. */}
+      <HugeiconsIcon icon={Loading03Icon} className="size-7 text-teal motion-safe:animate-spin motion-reduce:hidden" />
+      <p className="font-medium text-ink-2 motion-reduce:animate-pulse">Chargement de votre espace…</p>
+    </motion.div>
+  )
+}
+
 /** Phone-width column, session guard, four labelled tabs. */
 export function AppShell({ children }: { children: ReactNode }) {
   const { ready, loaded, session, stale, error, refreshing, refresh } = useStore()
@@ -26,6 +65,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   // card, the creation flow) is a level down and has its own back button.
   const showNav = NAV.some((item) => item.href === pathname)
   const online = useOnline()
+  // Not while a cached snapshot is painted at once: only when there is none yet.
+  const splash = useAtLeast(ready && !!session && !loaded && !error, SPLASH_MIN_MS)
 
   useEffect(() => {
     if (ready && !session) router.replace("/connexion")
@@ -36,10 +77,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   }
 
   // Pages read the snapshot without guards: render them only once there is one.
-  if (!loaded) {
+  if (!loaded || splash) {
     return (
       <div className="mx-auto min-h-dvh max-w-md bg-paper" aria-busy={!error}>
-        {error && <LoadFailed message={error} refreshing={refreshing} onRetry={() => void refresh()} />}
+        {splash ? <Splash /> : error && <LoadFailed message={error} refreshing={refreshing} onRetry={() => void refresh()} />}
       </div>
     )
   }

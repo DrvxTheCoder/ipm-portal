@@ -9,17 +9,25 @@ import { Loading03Icon } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
 import { BackLink } from "@/components/portal/app-shell"
 import { useStore } from "@/lib/store"
-import { ApiError, NETWORK_MESSAGE } from "@/lib/api"
+import { api, ApiError, FIRM_SLUG, NETWORK_MESSAGE } from "@/lib/api"
+import type { AccessRequestRequest, AccessRequestResponse } from "@/lib/schema"
 
 /**
  * Connexion par numéro de téléphone et code SMS — no password to forget,
  * nothing to type but digits. The phone and the code go to the server
  * together (`POST /api/portail/session`), which says whether they match.
  *
+ * A participant who gets no SMS asks the IPM for an access code
+ * (`POST /api/portail/access-request`). A manager passes it on; it is six
+ * digits and goes in the same field, to the same `/session`.
+ *
  * In the demo every account signs in with multiapp's DEMO_OTP; set
  * NEXT_PUBLIC_DEMO_CODE to the same value to show it on screen.
  */
 const DEMO_CODE = process.env.NEXT_PUBLIC_DEMO_CODE || null
+
+const SMS_CODE_LENGTH = 4
+const ACCESS_CODE_LENGTH = 6
 
 function formatPhone(digits: string) {
   return digits.replace(/(\d{2})(\d{0,3})(\d{0,2})(\d{0,2})/, (_, a, b, c, d) => [a, b, c, d].filter(Boolean).join(" "))
@@ -33,6 +41,9 @@ export default function ConnexionPage() {
   const [code, setCode] = useState("")
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [codeLength, setCodeLength] = useState(SMS_CODE_LENGTH)
+  const [requesting, setRequesting] = useState(false)
+  const [accessRequested, setAccessRequested] = useState(false)
   const codeRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -45,17 +56,48 @@ export default function ConnexionPage() {
 
   const digits = phone.replace(/\D/g, "")
 
+  function validPhone() {
+    if (/^7[05678]\d{7}$/.test(digits)) return true
+    setStep("phone")
+    setError("Entrez un numéro à 9 chiffres, par exemple 77 123 45 67.")
+    return false
+  }
+
   function sendCode() {
-    if (!/^7[05678]\d{7}$/.test(digits)) {
-      setError("Entrez un numéro à 9 chiffres, par exemple 77 123 45 67.")
-      return
-    }
+    if (!validPhone()) return
     setError(null)
     setStep("code")
   }
 
+  function switchCodeLength(length: number) {
+    setCodeLength(length)
+    setCode("")
+    setError(null)
+    codeRef.current?.focus()
+  }
+
+  async function requestAccess() {
+    if (requesting || !validPhone()) return
+    setRequesting(true)
+    setError(null)
+    try {
+      const body: AccessRequestRequest = { firmSlug: FIRM_SLUG, phone: digits }
+      await api<AccessRequestResponse>("/access-request", { method: "POST", auth: false, json: body })
+      setAccessRequested(true)
+      setCodeLength(ACCESS_CODE_LENGTH)
+      setCode("")
+      setStep("code")
+    } catch (failure) {
+      if (failure instanceof ApiError && failure.code === "INVALID_PHONE") setStep("phone")
+      // TOO_MANY_ATTEMPTS: the server's message says when to try again.
+      setError(failure instanceof ApiError ? failure.message : NETWORK_MESSAGE)
+    } finally {
+      setRequesting(false)
+    }
+  }
+
   async function verify(value: string) {
-    if (value.length < 4 || submitting) return
+    if (value.length < codeLength || submitting) return
     setSubmitting(true)
     setError(null)
     try {
@@ -120,6 +162,15 @@ export default function ConnexionPage() {
               <Button onClick={sendCode} className="h-14 w-full rounded-2xl text-lg font-semibold">
                 Recevoir le code par SMS
               </Button>
+              <Button
+                variant="ghost"
+                onClick={() => void requestAccess()}
+                disabled={requesting}
+                className="h-12 w-full rounded-2xl text-base text-teal"
+              >
+                {requesting && <HugeiconsIcon icon={Loading03Icon} className="size-5 animate-spin" />}
+                Je ne reçois pas le code
+              </Button>
             </div>
           </motion.div>
         ) : (
@@ -131,36 +182,50 @@ export default function ConnexionPage() {
             className="flex flex-1 flex-col"
           >
             <div className="mb-4">
-              <BackLink onClick={() => { setStep("phone"); setCode(""); setError(null) }} />
+              <BackLink onClick={() => { setStep("phone"); setCode(""); setError(null); setAccessRequested(false); setCodeLength(SMS_CODE_LENGTH) }} />
             </div>
-            <h1 className="figure text-[2.4rem] leading-none font-bold">Code reçu par SMS</h1>
-            <p className="mt-2 text-ink-2">Envoyé au {formatPhone(digits)}.</p>
+            {codeLength === ACCESS_CODE_LENGTH ? (
+              <>
+                <h1 className="figure text-[2.4rem] leading-none font-bold">Code d&apos;accès</h1>
+                <p className="mt-2 text-ink-2">Le code à 6 chiffres que votre IPM vous a communiqué, pour le {formatPhone(digits)}.</p>
+              </>
+            ) : (
+              <>
+                <h1 className="figure text-[2.4rem] leading-none font-bold">Code reçu par SMS</h1>
+                <p className="mt-2 text-ink-2">Envoyé au {formatPhone(digits)}.</p>
+              </>
+            )}
+            {accessRequested && (
+              <p role="status" className="mt-4 rounded-2xl bg-mint-wash p-4 text-[0.95rem] text-teal-deep">
+                Votre demande a été transmise à votre IPM. Un gestionnaire vous communiquera un code d&apos;accès à saisir ici.
+              </p>
+            )}
 
-            <label htmlFor="code" className="sr-only">Code à 4 chiffres</label>
+            <label htmlFor="code" className="sr-only">Code à {codeLength} chiffres</label>
             <div className="relative mt-8" onClick={() => codeRef.current?.focus()}>
               <input
                 ref={codeRef}
                 id="code"
                 inputMode="numeric"
                 autoComplete="one-time-code"
-                maxLength={4}
+                maxLength={codeLength}
                 value={code}
                 disabled={submitting}
                 onChange={(e) => {
-                  const v = e.target.value.replace(/\D/g, "").slice(0, 4)
+                  const v = e.target.value.replace(/\D/g, "").slice(0, codeLength)
                   setCode(v)
                   setError(null)
-                  if (v.length === 4) void verify(v)
+                  if (v.length === codeLength) void verify(v)
                 }}
                 className="absolute inset-0 opacity-0"
               />
-              <div className="grid grid-cols-4 gap-3" aria-hidden>
-                {[0, 1, 2, 3].map((i) => (
+              <div className={`grid gap-3 ${codeLength === ACCESS_CODE_LENGTH ? "grid-cols-6" : "grid-cols-4"}`} aria-hidden>
+                {Array.from({ length: codeLength }, (_, i) => (
                   <div
                     key={i}
-                    className={`figure flex h-20 items-center justify-center rounded-2xl bg-surface text-[2.6rem] font-bold ring-1 ${
-                      i === code.length ? "ring-2 ring-mint-deep" : "ring-line"
-                    }`}
+                    className={`figure flex items-center justify-center rounded-2xl bg-surface font-bold ring-1 ${
+                      codeLength === ACCESS_CODE_LENGTH ? "h-16 text-[2rem]" : "h-20 text-[2.6rem]"
+                    } ${i === code.length ? "ring-2 ring-mint-deep" : "ring-line"}`}
                   >
                     {code[i] ?? ""}
                   </div>
@@ -172,12 +237,32 @@ export default function ConnexionPage() {
             <div className="mt-auto space-y-3 pt-10">
               <Button
                 onClick={() => void verify(code)}
-                disabled={code.length < 4 || submitting}
+                disabled={code.length < codeLength || submitting}
                 className="h-14 w-full rounded-2xl text-lg font-semibold"
               >
                 {submitting && <HugeiconsIcon icon={Loading03Icon} className="size-5 animate-spin" />}
                 {submitting ? "Vérification…" : "Valider"}
               </Button>
+              {codeLength === SMS_CODE_LENGTH ? (
+                <div className="grid gap-1">
+                  <Button
+                    variant="ghost"
+                    onClick={() => void requestAccess()}
+                    disabled={requesting}
+                    className="h-12 w-full rounded-2xl text-base text-teal"
+                  >
+                    {requesting && <HugeiconsIcon icon={Loading03Icon} className="size-5 animate-spin" />}
+                    Je ne reçois pas le code : demander un code d&apos;accès
+                  </Button>
+                  <Button variant="ghost" onClick={() => switchCodeLength(ACCESS_CODE_LENGTH)} className="h-10 w-full rounded-2xl text-sm text-ink-2">
+                    J&apos;ai déjà un code d&apos;accès
+                  </Button>
+                </div>
+              ) : (
+                <Button variant="ghost" onClick={() => switchCodeLength(SMS_CODE_LENGTH)} className="h-10 w-full rounded-2xl text-sm text-ink-2">
+                  Saisir le code reçu par SMS
+                </Button>
+              )}
               {DEMO_CODE && (
                 <p className="text-center text-sm text-ink-3">
                   Démo : le code est <span className="figure text-base font-semibold text-teal">{DEMO_CODE}</span>

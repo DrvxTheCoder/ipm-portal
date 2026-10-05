@@ -38,7 +38,7 @@ import { family, type FamilyMember } from "@/lib/queries"
 import { bookingFor, draftTotal, eligibleProviders, preview, type DraftInput } from "@/domain/portal/issue"
 import { ApiError, dataUrlToBlob, NETWORK_MESSAGE } from "@/lib/api"
 import { francs, grouped, longDate } from "@/lib/format"
-import type { Db, DraftLine, IpmProvider, IpmVoucher, IpmVoucherType, PortalBooking } from "@/lib/schema"
+import type { DraftLine, IpmVoucher, IpmVoucherType, PortalBooking } from "@/lib/schema"
 import { cn } from "@/lib/utils"
 
 gsap.registerPlugin(useGSAP)
@@ -46,9 +46,10 @@ gsap.registerPlugin(useGSAP)
 type StepKey = "who" | "mode" | "scan" | "type" | "provider" | "amount" | "receipt" | "recap"
 type Mode = "SCAN" | "MANUAL"
 
+// Both paths share everything up to "mode": switching mode keeps the step index valid.
 const PATHS: Record<Mode, StepKey[]> = {
-  SCAN: ["who", "mode", "scan", "type", "provider", "amount", "recap"],
-  MANUAL: ["who", "mode", "type", "provider", "amount", "receipt", "recap"],
+  SCAN: ["who", "type", "provider", "mode", "scan", "amount", "recap"],
+  MANUAL: ["who", "type", "provider", "mode", "amount", "receipt", "recap"],
 }
 
 const TITLES: Record<StepKey, string> = {
@@ -60,13 +61,6 @@ const TITLES: Record<StepKey, string> = {
   amount: "Quel est le montant ?",
   receipt: "Joignez le reçu",
   recap: "Vérifiez avant de valider",
-}
-
-/** The type of bon a provider's specialty points to, when exactly one booking names it. */
-function typeForSpecialty(db: Db, specialtyId: string | null): IpmVoucherType | null {
-  if (!specialtyId) return null
-  const matches = db.bookings.filter((b) => b.specialtyIds.includes(specialtyId))
-  return matches.length === 1 ? matches[0].type : null
 }
 
 /**
@@ -81,29 +75,6 @@ function describeFailure(error: unknown): SubmitFailure {
   if (error.isNetwork || error.status >= 500 || error.code === "RETRY") return { kind: "retry", message: error.message }
   if (error.refusals.length > 0) return { kind: "refused", messages: error.refusals }
   return { kind: "refused", messages: [error.message] }
-}
-
-const STOP = new Set(["pharmacie", "pharma", "clinique", "optique", "hopital", "cabinet", "medical", "centre", "institut", "de", "la", "le", "du", "des", "et"])
-
-function tokens(value: string) {
-  return value
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= 3 && !STOP.has(t))
-}
-
-/** Matches the name printed at the top of the ticket against the providers. */
-function matchProvider(header: string | null, providers: IpmProvider[]): IpmProvider | null {
-  if (!header) return null
-  const read = new Set(tokens(header))
-  let best: { provider: IpmProvider; score: number } | null = null
-  for (const provider of providers) {
-    const score = tokens(provider.name).filter((t) => read.has(t)).length
-    if (score > 0 && (!best || score > best.score)) best = { provider, score }
-  }
-  return best?.provider ?? null
 }
 
 export default function NewVoucherPage() {
@@ -130,7 +101,6 @@ function NewVoucherFlow() {
   )
   const [type, setType] = useState<IpmVoucherType | null>(null)
   const [providerId, setProviderId] = useState<string | null>(null)
-  const [ocrProviderId, setOcrProviderId] = useState<string | null>(null)
   const [manualTotal, setManualTotal] = useState(0)
   const [lines, setLines] = useState<DraftLine[]>([])
   const [detailOpen, setDetailOpen] = useState(false)
@@ -186,14 +156,6 @@ function NewVoucherFlow() {
       setLines(ocr.lines)
       setDetailOpen(true)
     }
-    const eligible = db.providers.filter((p) => p.accredited && p.status === "ACTIVE")
-    const matched = matchProvider(ocr?.header ?? null, eligible)
-    if (matched) {
-      setProviderId(matched.id)
-      setOcrProviderId(matched.id)
-      const guessed = typeForSpecialty(db, matched.specialtyId)
-      if (guessed) setType(guessed)
-    }
     if (ocr?.total) {
       toast.success(`Montant lu : ${francs(ocr.total)}`, {
         description: ocr.engine === "claude" ? "Lecture assistée. Vérifiez-le à l'étape du montant." : "Vérifiez-le à l'étape du montant.",
@@ -215,7 +177,7 @@ function NewVoucherFlow() {
   }
 
   async function submit() {
-    if (!draft || !receipt || busy.current) return
+    if (!draft || busy.current) return
     // Issuing is the one thing the portal refuses offline: the IPM must see
     // the bon (ceilings, review) before a provider can be shown its QR.
     if (!navigator.onLine) {
@@ -229,7 +191,8 @@ function NewVoucherFlow() {
     setSubmitting(true)
     setFailure(null)
     try {
-      const blob = await dataUrlToBlob(receipt.receiptUrl)
+      // No photo (the participant skipped it): the bon is issued without one.
+      const blob = receipt ? await dataUrlToBlob(receipt.receiptUrl) : null
       const voucher = await issue({ ...draft, clientRequestId }, blob)
       setIssued(voucher)
     } catch (error) {
@@ -309,7 +272,7 @@ function NewVoucherFlow() {
                 {(
                   [
                     { key: "SCAN", icon: FileScanIcon, title: "Scanner le reçu", text: "Prenez le reçu en photo. Le montant est lu pour vous.", tag: "Le plus simple" },
-                    { key: "MANUAL", icon: PencilEdit02Icon, title: "Saisir moi-même", text: "Tapez le montant. Vous joindrez la photo du reçu à la fin.", tag: null },
+                    { key: "MANUAL", icon: PencilEdit02Icon, title: "Saisir moi-même", text: "Tapez le montant. Vous pourrez joindre la photo du reçu à la fin.", tag: null },
                   ] as const
                 ).map((option) => (
                   <button
@@ -318,7 +281,7 @@ function NewVoucherFlow() {
                     onClick={() => {
                       setMode(option.key)
                       setDirection(1)
-                      setStepIndex(2)
+                      setStepIndex(PATHS[option.key].indexOf("mode") + 1)
                     }}
                     className={cn(
                       "flex items-center gap-4 rounded-3xl p-5 text-left ring-1 transition-colors",
@@ -381,7 +344,6 @@ function NewVoucherFlow() {
               <ProviderPicker
                 booking={booking}
                 selected={providerId}
-                fromReceipt={ocrProviderId}
                 onPick={(id) => {
                   setProviderId(id)
                   go(1)
@@ -420,8 +382,11 @@ function NewVoucherFlow() {
                   </div>
                 ) : (
                   <>
-                    <p className="-mt-2 mb-4 text-ink-2">La photo est obligatoire : l&apos;IPM la compare à la facture du prestataire.</p>
+                    <p className="-mt-2 mb-4 text-ink-2">L&apos;IPM compare la photo à la facture du prestataire. Sans reçu, la vérification du bon peut prendre plus de temps.</p>
                     <ReceiptCapture read={false} onDone={(r) => setReceipt(r)} />
+                    <Button variant="ghost" onClick={() => go(1)} className="mt-1 h-12 w-full rounded-2xl text-base text-ink-2">
+                      Passer
+                    </Button>
                   </>
                 )}
               </div>
@@ -451,12 +416,10 @@ function NewVoucherFlow() {
 function ProviderPicker({
   booking,
   selected,
-  fromReceipt,
   onPick,
 }: {
   booking: PortalBooking
   selected: string | null
-  fromReceipt: string | null
   onPick: (id: string) => void
 }) {
   const { db, session } = useStore()
@@ -502,9 +465,7 @@ function ProviderPicker({
                   <span className="block font-semibold">{provider.name}</span>
                   <span className="block truncate text-sm text-ink-3">{provider.address}</span>
                 </span>
-                {fromReceipt === provider.id ? (
-                  <Badge tone="mint">Lu sur le reçu</Badge>
-                ) : recent ? (
+                {recent ? (
                   <Badge tone="neutral">Déjà utilisé</Badge>
                 ) : (
                   <span className="text-xs text-ink-3">{specialty?.label}</span>
