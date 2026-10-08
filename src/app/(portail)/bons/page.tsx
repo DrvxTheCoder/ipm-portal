@@ -8,19 +8,12 @@ import { HugeiconsIcon } from "@hugeicons/react"
 import { Add01Icon, Cancel01Icon, FilterHorizontalIcon, Search01Icon } from "@hugeicons/core-free-icons"
 import { PageHeader } from "@/components/portal/app-shell"
 import { VoucherRow } from "@/components/portal/voucher-row"
-import { VOUCHER_TYPE_META } from "@/components/portal/meta"
+import { matchesStatusFilter, STATUS_FILTERS, VOUCHER_TYPE_META } from "@/components/portal/meta"
 import { useStore } from "@/lib/store"
 import { family, providerName, vouchersOf } from "@/lib/queries"
 import { beneficiaryRef } from "@/domain/portal/refs"
 import { cn } from "@/lib/utils"
-import type { IpmVoucherStatus, IpmVoucherType } from "@/lib/schema"
-
-const STATUSES: Array<{ key: string; label: string; statuses: IpmVoucherStatus[] | null }> = [
-  { key: "all", label: "Tous", statuses: null },
-  { key: "active", label: "À utiliser", statuses: ["ISSUED", "PENDING_REVIEW"] },
-  { key: "done", label: "Utilisés", statuses: ["PRESENTED", "SETTLED", "INVOICED"] },
-  { key: "closed", label: "Annulés", statuses: ["CANCELLED", "EXPIRED", "REJECTED"] },
-]
+import type { IpmVoucherType } from "@/lib/schema"
 
 const TYPES: Array<{ key: IpmVoucherType | "all"; label: string }> = [
   { key: "all", label: "Tous" },
@@ -74,16 +67,17 @@ function BonsList() {
   const extraFilters = (type !== "all" ? 1 : 0) + (period !== "all" ? 1 : 0) + (amount !== "all" ? 1 : 0)
 
   const vouchers = useMemo(() => {
-    const statuses = STATUSES.find((s) => s.key === status)!.statuses
+    const now = new Date()
     const since = PERIODS.find((p) => p.key === period)!.since(new Date())
     const range = AMOUNTS.find((a) => a.key === amount)!
     const needle = fold(query.trim())
     return vouchersOf(db, memberId).filter((v) => {
       if (person && beneficiaryRef(v.memberId, v.dependentId ?? null) !== person.key) return false
-      if (statuses && !statuses.includes(v.status)) return false
+      if (!matchesStatusFilter(v, status, now)) return false
       if (type !== "all" && v.type !== type) return false
       if (new Date(v.issueDate).getTime() < since) return false
-      if (v.totalAmount < range.min || v.totalAmount >= range.max) return false
+      // A bon awaiting its amount has none to filter on: shown only under "Tous".
+      if (range.key !== "all" && (v.totalAmount === null || v.totalAmount < range.min || v.totalAmount >= range.max)) return false
       if (needle) {
         const haystack = fold([v.number, v.beneficiaryName, providerName(db, v.providerId), VOUCHER_TYPE_META[v.type].short].join(" "))
         if (!haystack.includes(needle)) return false
@@ -169,7 +163,7 @@ function BonsList() {
       </AnimatePresence>
 
       <div className="flex gap-2 overflow-x-auto px-4 pb-3 [scrollbar-width:none]" role="tablist" aria-label="Statut">
-        {STATUSES.map((s) => (
+        {STATUS_FILTERS.map((s) => (
           <button
             key={s.key}
             role="tab"

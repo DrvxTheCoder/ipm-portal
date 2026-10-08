@@ -1,6 +1,7 @@
 "use client"
 
 import Image from "next/image"
+import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useEffect, useRef, useState } from "react"
 import { AnimatePresence, motion } from "motion/react"
@@ -171,6 +172,9 @@ export default function ConnexionPage() {
                 {requesting && <HugeiconsIcon icon={Loading03Icon} className="size-5 animate-spin" />}
                 Je ne reçois pas le code
               </Button>
+              <p className="text-center text-sm">
+                <Link href="/prestataire/connexion" className="font-medium text-ink-3">Vous êtes une pharmacie ? Espace pharmacie</Link>
+              </p>
             </div>
           </motion.div>
         ) : (

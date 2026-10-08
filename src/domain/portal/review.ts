@@ -111,4 +111,7 @@ export const FLAG_LABELS: Record<IpmReviewFlag, string> = {
   RECEIPT_REUSED: "Reçu déjà utilisé pour un autre bon",
   OCR_MISMATCH: "Montant différent de celui lu sur le reçu",
   ISSUANCE_WARNING: "Avertissement à l'émission (cotisations en retard ou convention échue)",
+  AMOUNT_ABOVE_THRESHOLD: "Montant de pharmacie au-dessus du seuil de contrôle",
+  CEILING_CAPPED: "Prise en charge limitée par le plafond restant",
+  PRESCRIPTION_REUSED: "Ordonnance déjà jointe à un autre bon",
 }

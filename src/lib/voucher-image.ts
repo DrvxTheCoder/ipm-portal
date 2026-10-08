@@ -18,7 +18,10 @@ export type VoucherImageInput = {
   insurerShare: number
   memberShare: number
   appliedRate: number
-  totalAmount: number
+  /** Null: a bon de pharmacie awaiting its amount — no split, the pharmacy enters it. */
+  totalAmount: number | null
+  /** Shown for a pharmacy to type when it cannot scan. */
+  manualCode?: string | null
   providerName: string
   providerAddress: string | null
   expiryDate: string
@@ -130,30 +133,41 @@ export async function renderVoucherImage(v: VoucherImageInput): Promise<Blob> {
     }
   }
 
-  // Split
-  const pct = Math.round(v.appliedRate * 100)
+  // Split — or, before the pharmacy has priced the bon, what will happen.
   const barY = bandTop + bandH + 24
   const barW = cw - 2 * pad
-  ctx.fillStyle = C.sunken
-  ctx.beginPath()
-  ctx.roundRect(left, barY, barW, 12, 6)
-  ctx.fill()
-  ctx.fillStyle = C.mint
-  ctx.beginPath()
-  ctx.roundRect(left, barY, (barW * pct) / 100, 12, 6)
-  ctx.fill()
+  if (v.totalAmount === null) {
+    ctx.textAlign = "center"
+    ctx.font = `600 18px ${SANS}`
+    ctx.fillStyle = C.ink
+    ctx.fillText("Montant saisi par la pharmacie", W / 2, barY + 30)
+    ctx.font = `400 14px ${SANS}`
+    ctx.fillStyle = C.ink2
+    ctx.fillText(v.manualCode ? `Code : ${v.manualCode}` : "Présentez l'ordonnance avec ce bon", W / 2, barY + 58)
+    ctx.textAlign = "left"
+  } else {
+    const pct = Math.round(v.appliedRate * 100)
+    ctx.fillStyle = C.sunken
+    ctx.beginPath()
+    ctx.roundRect(left, barY, barW, 12, 6)
+    ctx.fill()
+    ctx.fillStyle = C.mint
+    ctx.beginPath()
+    ctx.roundRect(left, barY, (barW * pct) / 100, 12, 6)
+    ctx.fill()
 
-  ctx.font = `400 14px ${SANS}`
-  ctx.fillStyle = C.ink2
-  ctx.fillText(`L'IPM paie ${pct} %`, left, barY + 38)
-  ctx.textAlign = "right"
-  ctx.fillText(`Votre part ${100 - pct} %`, right, barY + 38)
-  ctx.font = `600 26px ${DISPLAY}`
-  ctx.fillStyle = C.ink
-  ctx.fillText(francs(v.memberShare), right, barY + 68)
-  ctx.textAlign = "left"
-  ctx.fillStyle = C.tealDeep
-  ctx.fillText(francs(v.insurerShare), left, barY + 68)
+    ctx.font = `400 14px ${SANS}`
+    ctx.fillStyle = C.ink2
+    ctx.fillText(`L'IPM paie ${pct} %`, left, barY + 38)
+    ctx.textAlign = "right"
+    ctx.fillText(`Votre part ${100 - pct} %`, right, barY + 38)
+    ctx.font = `600 26px ${DISPLAY}`
+    ctx.fillStyle = C.ink
+    ctx.fillText(francs(v.memberShare), right, barY + 68)
+    ctx.textAlign = "left"
+    ctx.fillStyle = C.tealDeep
+    ctx.fillText(francs(v.insurerShare), left, barY + 68)
+  }
 
   // Details
   let y = barY + 96
@@ -182,7 +196,7 @@ export async function renderVoucherImage(v: VoucherImageInput): Promise<Blob> {
   ctx.fillText("Total", left, y + 10)
   ctx.textAlign = "right"
   ctx.font = `700 26px ${DISPLAY}`
-  ctx.fillText(francs(v.totalAmount), right, y + 12)
+  ctx.fillText(v.totalAmount === null ? "À venir" : francs(v.totalAmount), right, y + 12)
   ctx.textAlign = "left"
 
   return new Promise((resolve, reject) =>

@@ -27,3 +27,12 @@ export function Qr({ value, className }: { value: string; className?: string }) 
 }
 
 export const verifyUrl = (token: string) => new URL(`/v/${token}`, process.env.NEXT_PUBLIC_URL).toString()
+
+/**
+ * What a bon's QR encodes. A bon de pharmacie carries its bare token, for the
+ * pharmacy's scanner (`/prestataire`); any other bon, the public verification
+ * page. Same rule as multiapp's PDF.
+ */
+export const qrValue = (voucher: { qrToken: string; deferredAmount: boolean }) =>
+  voucher.deferredAmount ? voucher.qrToken : verifyUrl(voucher.qrToken)
+

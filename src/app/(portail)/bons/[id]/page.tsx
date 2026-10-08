@@ -10,10 +10,12 @@ import { PageHeader } from "@/components/portal/app-shell"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
-import { Qr, verifyUrl } from "@/components/portal/qr"
+import { Qr, qrValue } from "@/components/portal/qr"
+import { PrescriptionImage } from "@/components/portal/prescription-image"
+import { groupedCode } from "@/domain/portal/bon-code"
 import { SplitBar } from "@/components/portal/split-bar"
 import { ReceiptImage } from "@/components/portal/receipt-image"
-import { STATUS_META, VOUCHER_TYPE_META } from "@/components/portal/meta"
+import { cancellable as isCancellable, effectiveStatus, statusMeta, VOUCHER_TYPE_META } from "@/components/portal/meta"
 import { useStore } from "@/lib/store"
 import { francs, grouped, longDate } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -21,11 +23,13 @@ import { shareVoucherImage } from "@/lib/voucher-image"
 import { ApiError, NETWORK_MESSAGE } from "@/lib/api"
 
 const CANCEL_REASONS = ["Je n'en ai plus besoin", "Erreur sur le montant", "Mauvais prestataire", "Autre raison"]
+const PHARMACY_CANCEL_REASONS = ["Je n'en ai plus besoin", "Mauvaise pharmacie", "Mauvaise ordonnance", "Autre raison"]
 
 export default function BonDetailPage() {
   const { id } = useParams<{ id: string }>()
-  const { db, cancel, markRead } = useStore()
+  const { db, cancel, markRead, refresh, refreshing } = useStore()
   const [receiptOpen, setReceiptOpen] = useState(false)
+  const [prescriptionOpen, setPrescriptionOpen] = useState(false)
   const [cancelOpen, setCancelOpen] = useState(false)
   const [reason, setReason] = useState(CANCEL_REASONS[0])
   const [cancelling, setCancelling] = useState(false)
@@ -52,17 +56,21 @@ export default function BonDetailPage() {
   const provider = db.providers.find((p) => p.id === voucher.providerId)
   const providerLabel = provider?.name ?? "Prestataire"
   const lines = db.voucherLines.filter((l) => l.voucherId === voucher.id)
-  const status = STATUS_META[voucher.status]
+  const status = statusMeta(voucher)
   const type = VOUCHER_TYPE_META[voucher.type]
-  const usable = voucher.status === "ISSUED"
-  const cancellable = voucher.status === "ISSUED" || voucher.status === "PENDING_REVIEW"
+  const current = effectiveStatus(voucher)
+  // A bon de pharmacie is shown at the counter while it waits for its amount.
+  const awaiting = current === "AWAITING_AMOUNT"
+  const usable = current === "ISSUED" || awaiting
+  const cancellable = isCancellable(voucher)
+  const reasons = voucher.deferredAmount ? PHARMACY_CANCEL_REASONS : CANCEL_REASONS
 
   async function confirmCancel() {
     if (!voucher || cancelling) return
     setCancelling(true)
     setCancelError(null)
     try {
-      await cancel(voucher.id, reason)
+      await cancel(voucher, reasons.includes(reason) ? reason : reasons[0])
       setCancelOpen(false)
       toast.success("Bon annulé")
     } catch (error) {
@@ -80,7 +88,8 @@ export default function BonDetailPage() {
         typeLabel: type.label,
         number: voucher.number,
         beneficiaryName: voucher.beneficiaryName,
-        qrValue: verifyUrl(voucher.qrToken),
+        qrValue: qrValue(voucher),
+        manualCode: voucher.deferredAmount ? groupedCode(voucher.qrToken) : null,
         insurerShare: voucher.insurerShare,
         memberShare: voucher.memberShare,
         appliedRate: voucher.appliedRate,
@@ -130,8 +139,15 @@ export default function BonDetailPage() {
 
           <div className="relative border-y border-dashed border-line bg-paper/60 px-5 py-6">
             <div className={cn("mx-auto size-52", !usable && "opacity-20 blur-[3px]")}>
-              <Qr value={verifyUrl(voucher.qrToken)} className="size-full" />
+              <Qr value={qrValue(voucher)} className="size-full" />
             </div>
+            {awaiting && (
+              <div className="mt-4 text-center">
+                <p className="text-sm text-ink-2">{status.explain}</p>
+                <p className="mt-2 text-xs text-ink-3">Si le scan échoue, la pharmacie saisit ce code :</p>
+                <p className="mt-1 font-mono text-[0.95rem] font-semibold tracking-wide break-all text-ink select-all">{groupedCode(voucher.qrToken)}</p>
+              </div>
+            )}
             {!usable && (
               <p className="absolute inset-x-6 top-1/2 -translate-y-1/2 rounded-xl bg-surface/95 p-3 text-center text-[0.95rem] text-ink-2 shadow">
                 {status.explain}
@@ -140,7 +156,21 @@ export default function BonDetailPage() {
           </div>
 
           <div className="p-5">
-            <SplitBar insurer={voucher.insurerShare} member={voucher.memberShare} rate={voucher.appliedRate} />
+            {voucher.totalAmount === null ? (
+              <p className="text-center text-[0.95rem] text-ink-2">
+                Le montant sera saisi par la pharmacie. L&apos;IPM paiera {Math.round(voucher.appliedRate * 100)} % dans la limite de votre plafond ; vous paierez le reste.
+              </p>
+            ) : (
+              <>
+                <SplitBar insurer={voucher.insurerShare} member={voucher.memberShare} rate={voucher.deferredAmount && voucher.totalAmount ? voucher.insurerShare / voucher.totalAmount : voucher.appliedRate} />
+                {voucher.adjustedByIpm && (
+                  <p className="mt-3 flex items-center gap-2 text-sm text-ink-2">
+                    <Badge tone="amber">Ajusté par l&apos;IPM</Badge>
+                    Le montant a été saisi ou corrigé par l&apos;IPM.
+                  </p>
+                )}
+              </>
+            )}
           </div>
         </section>
 
@@ -165,7 +195,8 @@ export default function BonDetailPage() {
             <Row label="Prestataire" value={providerLabel} />
             <Row label="Adresse" value={provider?.address ?? "—"} />
             <Row label="Créé le" value={longDate(voucher.issueDate)} />
-            <Row label="Valable jusqu'au" value={longDate(voucher.expiryDate)} />
+            <Row label={voucher.deferredAmount ? "À valider avant le" : "Valable jusqu'au"} value={longDate(voucher.expiryDate)} />
+            {voucher.validatedAt && <Row label="Validé le" value={longDate(voucher.validatedAt)} />}
             <Row label="Créé depuis" value={voucher.origin === "PORTAL" ? "Mon espace" : "Guichet IPM"} />
           </dl>
 
@@ -187,8 +218,19 @@ export default function BonDetailPage() {
           )}
           <div className="mt-4 flex items-baseline justify-between border-t border-line pt-4">
             <span className="font-semibold">Total</span>
-            <span className="figure text-2xl font-bold">{francs(voucher.totalAmount)}</span>
+            {voucher.totalAmount === null ? (
+              <span className="text-ink-3">À saisir par la pharmacie</span>
+            ) : (
+              <span className="figure text-2xl font-bold">{francs(voucher.totalAmount)}</span>
+            )}
           </div>
+
+          {voucher.deferredAmount && (
+            <button type="button" onClick={() => setPrescriptionOpen(true)} className="mt-4 flex w-full items-center gap-3 rounded-2xl bg-sunken p-3 text-left">
+              <PrescriptionImage src={voucher.prescriptionUrl} className="size-14 shrink-0 rounded-lg ring-1 ring-line" />
+              <span className="font-medium text-teal">Voir l&apos;ordonnance</span>
+            </button>
+          )}
 
           {voucher.receiptUrl && (
             <button type="button" onClick={() => setReceiptOpen(true)} className="mt-4 flex w-full items-center gap-3 rounded-2xl bg-sunken p-3 text-left">
@@ -214,6 +256,20 @@ export default function BonDetailPage() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={prescriptionOpen} onOpenChange={setPrescriptionOpen}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Ordonnance jointe</DialogTitle>
+          </DialogHeader>
+          <PrescriptionImage
+            src={voucher.prescriptionUrl}
+            onRenew={() => void refresh()}
+            renewing={refreshing}
+            className="max-h-[70dvh] min-h-40 w-full rounded-xl"
+          />
+        </DialogContent>
+      </Dialog>
+
       <Dialog
         open={cancelOpen}
         onOpenChange={(open) => {
@@ -225,10 +281,14 @@ export default function BonDetailPage() {
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>Annuler le bon {voucher.number} ?</DialogTitle>
-            <DialogDescription>Le code QR ne fonctionnera plus, et le montant sera rendu à votre plafond du mois.</DialogDescription>
+            <DialogDescription>
+              {awaiting
+                ? "Le code QR ne fonctionnera plus : la pharmacie ne pourra plus valider ce bon."
+                : "Le code QR ne fonctionnera plus, et le montant sera rendu à votre plafond du mois."}
+            </DialogDescription>
           </DialogHeader>
           <div className="grid gap-2">
-            {CANCEL_REASONS.map((r) => (
+            {reasons.map((r) => (
               <button
                 key={r}
                 type="button"

@@ -273,6 +273,11 @@ export function seed(): Db {
       reviewedById: null,
       reviewedAt: null,
       reviewReason: null,
+      deferredAmount: false,
+      prescriptionUrl: null,
+      amountSource: null,
+      validatedAt: null,
+      adjustedByIpm: false,
       createdAt: issueDate,
     })
 
@@ -331,6 +336,8 @@ export function seed(): Db {
       reviewThresholdRatio: 0.5,
       unusualAmountMultiple: 3,
       ocrMismatchTolerance: 0.15,
+      pharmacyValidationDays: 7,
+      pharmacyReviewThreshold: null,
     },
     // What the server resolves: here only the formule's rows, for every
     // beneficiary type the family has.

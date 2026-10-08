@@ -3,12 +3,16 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { useRouter } from "next/navigation"
 import { toast } from "sonner"
+import { notificationView } from "@/components/portal/meta"
 import { api, ApiError, clearToken, FIRM_SLUG, getToken, onUnauthorized, setToken } from "@/lib/api"
 import type {
   CreateVoucherResponse,
   Db,
   IpmVoucher,
   NotificationsResponse,
+  PharmacyIssueResponse,
+  PharmacyPreviewResponse,
+  PharmacyVoucherRequest,
   PortalNotification,
   SessionResponse,
   VoucherDraft,
@@ -53,8 +57,19 @@ type Store = {
   /** Issues the bon on the server and returns it as written. Throws `ApiError`. */
   /** `receipt` null: the participant skipped the photo, no `receipt` part is sent. */
   issue: (draft: VoucherDraft, receipt: Blob | null) => Promise<IpmVoucher>
-  /** Throws `ApiError`. */
-  cancel: (voucherId: string, reason: string) => Promise<IpmVoucher>
+  /**
+   * Bon de pharmacie à montant différé: eligibility only, nothing written.
+   * Throws `ApiError`.
+   */
+  previewPharmacy: (request: PharmacyVoucherRequest) => Promise<PharmacyPreviewResponse>
+  /**
+   * Issues a bon de pharmacie without an amount, the ordonnance attached. The
+   * same `clientRequestId` on a retry returns the bon already written.
+   * Throws `ApiError`.
+   */
+  issuePharmacy: (request: PharmacyVoucherRequest & { clientRequestId: string }, prescription: Blob) => Promise<PharmacyIssueResponse>
+  /** Throws `ApiError`. A bon de pharmacie goes through `/voucher/cancel`. */
+  cancel: (voucher: Pick<IpmVoucher, "id" | "deferredAmount">, reason: string) => Promise<IpmVoucher>
   /** Marks a bon's notifications read, if it has any. */
   markRead: (voucherId: string) => void
 }
@@ -78,7 +93,7 @@ const EMPTY_DB: Db = {
   voucherLines: [],
   consumptions: [],
   portalAccounts: [],
-  settings: { firmId: "", reviewThresholdAmount: 0, reviewThresholdRatio: 0, unusualAmountMultiple: 0, ocrMismatchTolerance: 0 },
+  settings: { firmId: "", reviewThresholdAmount: 0, reviewThresholdRatio: 0, unusualAmountMultiple: 0, ocrMismatchTolerance: 0, pharmacyValidationDays: 0, pharmacyReviewThreshold: null },
   bookings: [],
   ceilings: [],
   sequences: { PHARMACY: 0, OPTICAL: 0, GUARANTEE: 0, HOSPITALIZATION: 0 },
@@ -183,16 +198,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const fresh = list.filter((n) => !notified.has(n.id))
     if (fresh.length === 0) return
     for (const n of fresh) {
-      const approved = n.kind === "VOUCHER_APPROVED"
-      const message = approved
-        ? `Votre bon ${n.voucher.number} est validé`
-        : `Votre bon ${n.voucher.number} a été refusé`
+      const view = notificationView(n)
       const options = {
-        description: approved ? "Il est prêt à être présenté." : (n.voucher.reviewReason ?? undefined),
+        description:
+          view.detail ??
+          (n.kind === "VOUCHER_APPROVED" ? "Il est prêt à être présenté." : undefined),
         action: { label: "Voir", onClick: () => router.push(`/bons/${n.voucher.id}`) },
       }
-      if (approved) toast.success(message, options)
-      else toast.error(message, options)
+      if (view.tone === "good") toast.success(view.title, options)
+      else toast.error(view.title, options)
     }
     write(NOTIFIED_KEY, [...fresh.map((n) => n.id), ...notified].slice(0, 200))
     // The bon's status changed on the server: show it everywhere.
@@ -279,12 +293,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [refresh]
   )
 
+  const previewPharmacy = useCallback(
+    (request: PharmacyVoucherRequest) =>
+      api<PharmacyPreviewResponse>("/voucher/preview", { method: "POST", json: request }),
+    []
+  )
+
+  const issuePharmacy = useCallback(
+    async (request: PharmacyVoucherRequest & { clientRequestId: string }, prescription: Blob) => {
+      const form = new FormData()
+      form.append("request", JSON.stringify(request))
+      const extension = prescription.type === "image/png" ? "png" : prescription.type === "image/webp" ? "webp" : "jpg"
+      form.append("prescription", prescription, `ordonnance.${extension}`)
+      const issued = await api<PharmacyIssueResponse>("/voucher/issue", { method: "POST", form })
+      // The answer names the bon only: the snapshot brings it whole, with its
+      // ordonnance link. A refresh already in flight started before the bon
+      // existed: let it finish, then ask again. Awaited, so the next screen
+      // can show the bon.
+      if (inflight.current) await inflight.current
+      await refresh()
+      return issued
+    },
+    [refresh]
+  )
+
   const cancel = useCallback(
-    async (voucherId: string, reason: string) => {
-      const updated = await api<CreateVoucherResponse>(`/vouchers/${encodeURIComponent(voucherId)}/cancel`, {
-        method: "POST",
-        json: { reason },
-      })
+    async (voucher: Pick<IpmVoucher, "id" | "deferredAmount">, reason: string) => {
+      const updated = voucher.deferredAmount
+        ? await api<CreateVoucherResponse>("/voucher/cancel", { method: "POST", json: { voucherId: voucher.id, reason } })
+        : await api<CreateVoucherResponse>(`/vouchers/${encodeURIComponent(voucher.id)}/cancel`, {
+            method: "POST",
+            json: { reason },
+          })
       setDb((current) => withVoucher(current, updated))
       void refresh()
       return updated.voucher
@@ -317,10 +357,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       signOut: clear,
       refresh,
       issue,
+      previewPharmacy,
+      issuePharmacy,
       cancel,
       markRead,
     }),
-    [ready, loaded, db, session, error, refreshing, notifications, signIn, clear, refresh, issue, cancel, markRead]
+    [ready, loaded, db, session, error, refreshing, notifications, signIn, clear, refresh, issue, previewPharmacy, issuePharmacy, cancel, markRead]
   )
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>

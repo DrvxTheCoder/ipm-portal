@@ -10,6 +10,7 @@ import {
   CheckmarkCircle02Icon,
   ChartUpIcon,
   Clock01Icon,
+  HourglassIcon,
   IdCardIcon,
   Location01Icon,
   UserGroupIcon,
@@ -17,7 +18,7 @@ import {
 import { Avatar } from "@/components/portal/avatar"
 import { Envelope } from "@/components/portal/envelope"
 import { VoucherRow } from "@/components/portal/voucher-row"
-import { VOUCHER_TYPE_META } from "@/components/portal/meta"
+import { notificationView, VOUCHER_TYPE_META, effectiveStatus } from "@/components/portal/meta"
 import { useStore } from "@/lib/store"
 import { envelope, family, providerName, vouchersOf } from "@/lib/queries"
 import { cn } from "@/lib/utils"
@@ -80,6 +81,9 @@ export default function HomePage() {
 
   const vouchers = vouchersOf(db, memberId)
   const pending = vouchers.filter((v) => v.status === "PENDING_REVIEW")
+  // Bons de pharmacie the pharmacy has not priced yet: nothing is deducted
+  // until it does, so the balance above does not include them.
+  const awaiting = vouchers.filter((v) => effectiveStatus(v) === "AWAITING_AMOUNT")
   const online = useOnline()
 
   return (
@@ -97,24 +101,21 @@ export default function HomePage() {
       {notifications.length > 0 && (
         <ul className="mx-5 mt-5 space-y-2.5" aria-label="Notifications">
           {notifications.map((n) => {
-            const approved = n.kind === "VOUCHER_APPROVED"
+            const view = notificationView(n)
+            const good = view.tone === "good"
             return (
               <li key={n.id}>
                 <Link
                   href={`/bons/${n.voucher.id}`}
                   className={cn(
                     "flex items-center gap-3 rounded-2xl p-3.5",
-                    approved ? "bg-mint text-teal-deep" : "bg-red-tint text-red"
+                    good ? "bg-mint text-teal-deep" : "bg-red-tint text-red"
                   )}
                 >
-                  <HugeiconsIcon icon={approved ? CheckmarkCircle02Icon : Alert02Icon} className="size-6 shrink-0" />
+                  <HugeiconsIcon icon={good ? CheckmarkCircle02Icon : Alert02Icon} className="size-6 shrink-0" />
                   <span className="min-w-0 flex-1 text-[0.95rem]">
-                    <span className="block font-medium">
-                      {approved ? `Bon ${n.voucher.number} validé, prêt à utiliser` : `Bon ${n.voucher.number} refusé`}
-                    </span>
-                    {!approved && n.voucher.reviewReason && (
-                      <span className="mt-0.5 line-clamp-2 block text-sm">{n.voucher.reviewReason}</span>
-                    )}
+                    <span className="block font-medium">{view.title}</span>
+                    {view.detail && <span className="mt-0.5 line-clamp-2 block text-sm">{view.detail}</span>}
                   </span>
                   <HugeiconsIcon icon={ArrowRight01Icon} className="size-5 shrink-0" />
                 </Link>
@@ -132,6 +133,19 @@ export default function HomePage() {
           <HugeiconsIcon icon={Clock01Icon} className="size-6 shrink-0" />
           <span className="flex-1 text-[0.95rem] font-medium">
             {pending.length === 1 ? "1 bon en attente de validation" : `${pending.length} bons en attente de validation`}
+          </span>
+          <HugeiconsIcon icon={ArrowRight01Icon} className="size-5" />
+        </Link>
+      )}
+
+      {awaiting.length > 0 && (
+        <Link
+          href={awaiting.length === 1 ? `/bons/${awaiting[0].id}` : "/bons"}
+          className="mx-5 mt-5 flex items-center gap-3 rounded-2xl bg-amber-tint p-3.5 text-amber"
+        >
+          <HugeiconsIcon icon={HourglassIcon} className="size-6 shrink-0" />
+          <span className="flex-1 text-[0.95rem] font-medium">
+            {awaiting.length === 1 ? "1 bon de pharmacie en attente de montant" : `${awaiting.length} bons de pharmacie en attente de montant`}
           </span>
           <HugeiconsIcon icon={ArrowRight01Icon} className="size-5" />
         </Link>
@@ -172,6 +186,7 @@ export default function HomePage() {
               source={current.source}
               rate={current.rate}
               label={`${current.label} `}
+              awaiting={awaiting.filter((v) => v.categoryId === current.id).length}
             />
           </div>
           {people.length > 1 && (

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { decideReview } from "@/domain/portal/review"
 
-const settings = { firmId: "f", reviewThresholdAmount: 100_000, reviewThresholdRatio: 0.5, unusualAmountMultiple: 3, ocrMismatchTolerance: 0.15 }
+const settings = { firmId: "f", reviewThresholdAmount: 100_000, reviewThresholdRatio: 0.5, unusualAmountMultiple: 3, ocrMismatchTolerance: 0.15, pharmacyValidationDays: 7, pharmacyReviewThreshold: null }
 const base = { ceilingMonthly: 200_000, settings, previousTotals: [], sameDayDuplicate: false, receiptHash: null, previousReceiptHashes: [], ocrTotal: null }
 
 describe("decideReview", () => {

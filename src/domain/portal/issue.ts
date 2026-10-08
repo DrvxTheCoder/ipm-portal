@@ -196,7 +196,8 @@ export function preview(
 
   const familyCategoryTotals = db.vouchers
     .filter((v) => v.memberId === memberId && v.categoryId === booking.categoryId && LIVE.has(v.status))
-    .map((v) => v.totalAmount)
+    // A pharmacy bon awaiting its amount has none to compare against.
+    .flatMap((v) => (v.totalAmount === null ? [] : [v.totalAmount]))
 
   const policy = decision.allowed
     ? decideReview({

@@ -21,17 +21,43 @@ type Phase =
   | { kind: "reading"; preview: string; progress: OcrProgress | null }
   | { kind: "failed"; preview: string; message: string; image: LoadedImage }
 
+/** What is being photographed: the words change, the checks do not. */
+const SUBJECTS = {
+  receipt: {
+    alt: "Reçu",
+    take: "Prendre le reçu en photo",
+    hint: "Posez le reçu à plat, bien éclairé, le total visible.",
+    it: "le reçu",
+    // Enough for OCR on a till receipt.
+    maxSide: 1100,
+    quality: 0.72,
+  },
+  prescription: {
+    alt: "Ordonnance",
+    take: "Prendre l'ordonnance en photo",
+    hint: "Posez l'ordonnance à plat, bien éclairée, toute la page visible.",
+    it: "l'ordonnance",
+    // Handwriting: the pharmacist must be able to read every line.
+    maxSide: 1600,
+    quality: 0.8,
+  },
+} as const
+
 /**
- * Prendre le reçu en photo. With `read`, the photo is also read (scan path);
- * without, it is only checked, hashed and attached (manual path).
+ * Prendre le reçu (or the ordonnance) en photo. With `read`, the photo is also
+ * read (scan path); without, it is only checked, hashed and attached (manual
+ * path, and every ordonnance — nothing is read off a prescription).
  */
 export function ReceiptCapture({
   read,
   onDone,
+  subject = "receipt",
 }: {
   read: boolean
   onDone: (receipt: CapturedReceipt) => void
+  subject?: keyof typeof SUBJECTS
 }) {
+  const copy = SUBJECTS[subject]
   const camera = useRef<HTMLInputElement>(null)
   const gallery = useRef<HTMLInputElement>(null)
   const [phase, setPhase] = useState<Phase>({ kind: "idle" })
@@ -64,7 +90,7 @@ export function ReceiptCapture({
     try {
       const image = await loadImage(file)
       const quality = assessQuality(image)
-      const preview = toStoredJpeg(image)
+      const preview = toStoredJpeg(image, copy.maxSide, copy.quality)
       if (!quality.ok) {
         setPhase({ kind: "poor", image, quality, preview })
         return
@@ -106,12 +132,13 @@ export function ReceiptCapture({
   }
 
   if (phase.kind === "poor" || phase.kind === "failed") {
-    const message = phase.kind === "poor" ? QUALITY_MESSAGES[phase.quality.problem!] : phase.message
+    const message =
+      phase.kind === "poor" ? QUALITY_MESSAGES[phase.quality.problem!].replace("le reçu", copy.it) : phase.message
     return (
       <div className="flex flex-col items-center">
         {inputs}
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={phase.preview} alt="Reçu" className="max-h-64 rounded-2xl ring-1 ring-line" />
+        <img src={phase.preview} alt={copy.alt} className="max-h-64 rounded-2xl ring-1 ring-line" />
         <p className="mt-4 flex items-start gap-2 rounded-xl bg-amber-tint p-3 text-[0.95rem] text-amber">
           <HugeiconsIcon icon={Alert02Icon} className="mt-0.5 size-5 shrink-0" />
           {message}
@@ -151,8 +178,8 @@ export function ReceiptCapture({
         <span className="inline-flex size-20 items-center justify-center rounded-full bg-teal text-white shadow-lg">
           <HugeiconsIcon icon={Camera01Icon} className="size-9" />
         </span>
-        <span className="text-lg font-semibold">{phase.kind === "checking" ? "Vérification…" : "Prendre le reçu en photo"}</span>
-        <span className="max-w-60 text-center text-sm text-ink-2">Posez le reçu à plat, bien éclairé, le total visible.</span>
+        <span className="text-lg font-semibold">{phase.kind === "checking" ? "Vérification…" : copy.take}</span>
+        <span className="max-w-60 text-center text-sm text-ink-2">{copy.hint}</span>
       </button>
       <Button variant="ghost" onClick={() => gallery.current?.click()} className="mt-3 h-12 w-full rounded-2xl text-base text-teal">
         <HugeiconsIcon icon={Image01Icon} className="size-5" />

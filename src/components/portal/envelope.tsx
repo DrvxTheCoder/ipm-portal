@@ -17,6 +17,9 @@ gsap.registerPlugin(useGSAP)
  *
  * Without a ceiling (`ceiling` null) there is nothing left to count down: the
  * figure is what the IPM has paid this month, and the line says there is no cap.
+ *
+ * Bons de pharmacie awaiting their amount (`awaiting`) are not in the figure:
+ * the server deducts nothing until the pharmacy validates. A line says so.
  */
 
 const SOURCE_NOTE: Record<IpmCeilingSource, string | null> = {
@@ -32,6 +35,7 @@ export function Envelope({
   period = "mois",
   source = null,
   rate = null,
+  awaiting = 0,
 }: {
   /** Left under the ceiling; with no ceiling, the IPM share consumed this month. */
   remaining: number
@@ -42,6 +46,8 @@ export function Envelope({
   period?: "mois" | "an"
   source?: IpmCeilingSource | null
   rate?: number | null
+  /** Bons in this category waiting for the pharmacy's amount. */
+  awaiting?: number
 }) {
   const scope = useRef<HTMLDivElement>(null)
   const figure = useRef<HTMLSpanElement>(null)
@@ -96,6 +102,11 @@ export function Envelope({
         <p className="mt-3 text-sm text-ink-3">
           Pris en charge ce mois-ci · sans plafond
           {rate !== null && <>, l&apos;IPM paie {Math.round(rate * 100)} % de chaque bon</>}
+        </p>
+      )}
+      {awaiting > 0 && (
+        <p className="mt-2 rounded-xl bg-amber-tint px-3 py-2 text-sm text-amber">
+          {awaiting === 1 ? "1 bon en attente de montant" : `${awaiting} bons en attente de montant`} : sera déduit à la validation par la pharmacie.
         </p>
       )}
     </div>

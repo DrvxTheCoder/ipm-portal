@@ -1,7 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import { Suspense, useMemo, useRef, useState, type CSSProperties } from "react"
+import { Suspense, useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { AnimatePresence, motion } from "motion/react"
 import gsap from "gsap"
@@ -15,6 +15,7 @@ import {
   Clock01Icon,
   Delete02Icon,
   FileScanIcon,
+  HourglassIcon,
   Loading03Icon,
   PencilEdit02Icon,
   Search01Icon,
@@ -32,25 +33,43 @@ import { SplitBar } from "@/components/portal/split-bar"
 import { OfflineNotice } from "@/components/portal/offline"
 import { useOnline } from "@/lib/pwa"
 import { Qr, verifyUrl } from "@/components/portal/qr"
-import { VOUCHER_TYPE_META } from "@/components/portal/meta"
+import { STATUS_META, VOUCHER_TYPE_META } from "@/components/portal/meta"
 import { useStore } from "@/lib/store"
 import { family, type FamilyMember } from "@/lib/queries"
 import { bookingFor, draftTotal, eligibleProviders, preview, type DraftInput } from "@/domain/portal/issue"
 import { ApiError, dataUrlToBlob, NETWORK_MESSAGE } from "@/lib/api"
+import { randomId } from "@/lib/random-id"
+import { beneficiaryRef } from "@/domain/portal/refs"
+import { groupedCode } from "@/domain/portal/bon-code"
 import { francs, grouped, longDate } from "@/lib/format"
-import type { DraftLine, IpmVoucher, IpmVoucherType, PortalBooking } from "@/lib/schema"
+import type {
+  DraftLine,
+  IpmVoucher,
+  IpmVoucherType,
+  PharmacyIssueResponse,
+  PharmacyPreviewResponse,
+  PortalBooking,
+} from "@/lib/schema"
 import { cn } from "@/lib/utils"
 
 gsap.registerPlugin(useGSAP)
 
-type StepKey = "who" | "mode" | "scan" | "type" | "provider" | "amount" | "receipt" | "recap"
+type StepKey = "who" | "mode" | "scan" | "type" | "provider" | "amount" | "receipt" | "ordonnance" | "recap"
 type Mode = "SCAN" | "MANUAL"
 
-// Both paths share everything up to "mode": switching mode keeps the step index valid.
+// Every path shares everything up to "provider", and the two receipt paths up
+// to "mode": switching type or mode keeps the step index valid.
 const PATHS: Record<Mode, StepKey[]> = {
   SCAN: ["who", "type", "provider", "mode", "scan", "amount", "recap"],
   MANUAL: ["who", "type", "provider", "mode", "amount", "receipt", "recap"],
 }
+
+/**
+ * Bon de pharmacie: no amount and no receipt — a pharmacy gives a receipt only
+ * once paid. The ordonnance is attached instead, and the pharmacy enters the
+ * amount when it validates the bon (`/prestataire`).
+ */
+const PHARMACY_PATH: StepKey[] = ["who", "type", "provider", "ordonnance", "recap"]
 
 const TITLES: Record<StepKey, string> = {
   who: "Pour qui est ce bon ?",
@@ -60,6 +79,7 @@ const TITLES: Record<StepKey, string> = {
   provider: "Chez quel prestataire ?",
   amount: "Quel est le montant ?",
   receipt: "Joignez le reçu",
+  ordonnance: "Joignez l'ordonnance",
   recap: "Vérifiez avant de valider",
 }
 
@@ -71,7 +91,11 @@ const TITLES: Record<StepKey, string> = {
 type SubmitFailure = { kind: "refused"; messages: string[] } | { kind: "retry"; message: string }
 
 function describeFailure(error: unknown): SubmitFailure {
-  if (!(error instanceof ApiError)) return { kind: "retry", message: NETWORK_MESSAGE }
+  if (!(error instanceof ApiError)) {
+    // Not the server's answer: a bug or a browser limitation. Keep it visible to whoever debugs.
+    console.error(error)
+    return { kind: "retry", message: NETWORK_MESSAGE }
+  }
   if (error.isNetwork || error.status >= 500 || error.code === "RETRY") return { kind: "retry", message: error.message }
   if (error.refusals.length > 0) return { kind: "refused", messages: error.refusals }
   return { kind: "refused", messages: [error.message] }
@@ -88,7 +112,7 @@ export default function NewVoucherPage() {
 function NewVoucherFlow() {
   const router = useRouter()
   const params = useSearchParams()
-  const { db, session, issue } = useStore()
+  const { db, session, issue, issuePharmacy } = useStore()
   const memberId = session!.memberId
   const people = useMemo(() => family(db, memberId), [db, memberId])
 
@@ -105,7 +129,9 @@ function NewVoucherFlow() {
   const [lines, setLines] = useState<DraftLine[]>([])
   const [detailOpen, setDetailOpen] = useState(false)
   const [receipt, setReceipt] = useState<CapturedReceipt | null>(null)
+  const [prescription, setPrescription] = useState<CapturedReceipt | null>(null)
   const [issued, setIssued] = useState<IpmVoucher | null>(null)
+  const [issuedPharmacy, setIssuedPharmacy] = useState<PharmacyIssueResponse | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [failure, setFailure] = useState<{ key: string; value: SubmitFailure } | null>(null)
   // Idempotency key for this exact draft. A ref, not state: a double tap must
@@ -114,7 +140,8 @@ function NewVoucherFlow() {
   const busy = useRef(false)
   const online = useOnline()
 
-  const path = PATHS[mode]
+  const pharmacy = type === "PHARMACY"
+  const path = pharmacy ? PHARMACY_PATH : PATHS[mode]
   const step = path[stepIndex]
   const who: FamilyMember | undefined =
     dependentId === undefined ? undefined : people.find((p) => p.dependentId === dependentId)
@@ -184,13 +211,12 @@ function NewVoucherFlow() {
       setFailure({ key: draftKey, value: { kind: "retry", message: NETWORK_MESSAGE } })
       return
     }
-    if (request.current?.key !== draftKey) request.current = { key: draftKey, id: crypto.randomUUID() }
-    const clientRequestId = request.current.id
-
     busy.current = true
     setSubmitting(true)
     setFailure(null)
     try {
+      if (request.current?.key !== draftKey) request.current = { key: draftKey, id: randomId() }
+      const clientRequestId = request.current.id
       // No photo (the participant skipped it): the bon is issued without one.
       const blob = receipt ? await dataUrlToBlob(receipt.receiptUrl) : null
       const voucher = await issue({ ...draft, clientRequestId }, blob)
@@ -203,6 +229,49 @@ function NewVoucherFlow() {
       busy.current = false
       setSubmitting(false)
     }
+  }
+
+  // The pharmacy request as submitted: another person, pharmacy or photo is a new one.
+  const pharmacyKey =
+    pharmacy && providerId && dependentId !== undefined && prescription
+      ? JSON.stringify([dependentId, providerId, prescription.receiptHash, prescription.receiptUrl.length])
+      : ""
+  const shownPharmacyFailure = failure?.key === pharmacyKey ? failure.value : null
+
+  async function submitPharmacy() {
+    if (!pharmacyKey || !providerId || dependentId === undefined || !prescription || busy.current) return
+    if (!navigator.onLine) {
+      setFailure({ key: pharmacyKey, value: { kind: "retry", message: NETWORK_MESSAGE } })
+      return
+    }
+    busy.current = true
+    setSubmitting(true)
+    setFailure(null)
+    try {
+      if (request.current?.key !== pharmacyKey) request.current = { key: pharmacyKey, id: randomId() }
+      const clientRequestId = request.current.id
+      const result = await issuePharmacy(
+        { beneficiaryRef: beneficiaryRef(memberId, dependentId), category: "PHARMACY", providerId, clientRequestId },
+        await dataUrlToBlob(prescription.receiptUrl)
+      )
+      setIssuedPharmacy(result)
+    } catch (error) {
+      setFailure({ key: pharmacyKey, value: describeFailure(error) })
+      if (error instanceof ApiError && error.code === "REQUEST_ID_CONFLICT") request.current = null
+    } finally {
+      busy.current = false
+      setSubmitting(false)
+    }
+  }
+
+  if (issuedPharmacy) {
+    return (
+      <PharmacyDone
+        issued={issuedPharmacy}
+        beneficiaryName={who?.name ?? ""}
+        providerName={db.providers.find((p) => p.id === providerId)?.name ?? "la pharmacie"}
+      />
+    )
   }
 
   if (issued) return <Done voucher={issued} providerName={db.providers.find((p) => p.id === issued.providerId)?.name ?? "votre prestataire"} />
@@ -226,7 +295,9 @@ function NewVoucherFlow() {
         <Link href="/" className="text-sm font-medium text-ink-3">Fermer</Link>
       </div>
 
-      <h1 className="figure mt-6 text-[2.1rem] leading-[1.05] font-bold">{TITLES[step]}</h1>
+      <h1 className="figure mt-6 text-[2.1rem] leading-[1.05] font-bold">
+        {step === "provider" && pharmacy ? "Dans quelle pharmacie ?" : TITLES[step]}
+      </h1>
 
       <div className="relative mt-5 flex flex-1 flex-col">
         <AnimatePresence mode="wait" custom={direction} initial={false}>
@@ -340,6 +411,10 @@ function NewVoucherFlow() {
               </div>
             )}
 
+            {step === "provider" && booking && pharmacy && (
+              <p className="-mt-2 mb-4 text-ink-2">Seule cette pharmacie pourra valider le bon.</p>
+            )}
+
             {step === "provider" && booking && (
               <ProviderPicker
                 booking={booking}
@@ -392,7 +467,45 @@ function NewVoucherFlow() {
               </div>
             )}
 
-            {step === "recap" && draft && booking && who && (
+            {step === "ordonnance" && (
+              <div className="flex flex-1 flex-col">
+                {prescription ? (
+                  <div className="flex flex-col items-center">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={prescription.receiptUrl} alt="Ordonnance jointe" className="max-h-80 rounded-2xl ring-1 ring-line" />
+                    <p className="mt-3 flex items-center gap-1.5 font-medium text-teal">
+                      <HugeiconsIcon icon={CheckmarkCircle02Icon} className="size-5" /> Ordonnance jointe
+                    </p>
+                    <div className="mt-auto grid w-full gap-2.5 pt-6">
+                      <Button onClick={() => go(1)} className="h-14 rounded-2xl text-lg font-semibold">Continuer</Button>
+                      <Button variant="ghost" onClick={() => setPrescription(null)} className="h-12 rounded-2xl text-teal">
+                        <HugeiconsIcon icon={Camera01Icon} className="size-5" /> Changer de photo
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <p className="-mt-2 mb-4 text-ink-2">
+                      Pas de montant à saisir : la pharmacie l&apos;indiquera en validant le bon. L&apos;ordonnance est obligatoire.
+                    </p>
+                    <ReceiptCapture read={false} subject="prescription" onDone={(captured) => setPrescription(captured)} />
+                  </>
+                )}
+              </div>
+            )}
+
+            {step === "recap" && pharmacy && providerId && who && prescription && (
+              <PharmacyRecap
+                who={who}
+                providerId={providerId}
+                prescriptionUrl={prescription.receiptUrl}
+                submitting={submitting}
+                failure={shownPharmacyFailure}
+                onSubmit={() => void submitPharmacy()}
+              />
+            )}
+
+            {step === "recap" && !pharmacy && draft && booking && who && (
               <Recap
                 draft={draft}
                 booking={booking}
@@ -760,7 +873,7 @@ function Done({ voucher, providerName }: { voucher: IpmVoucher; providerName: st
             <p className="text-sm text-ink-3">{VOUCHER_TYPE_META[voucher.type].label}</p>
             <p className="figure text-2xl font-bold tracking-wide">{voucher.number}</p>
           </div>
-          <p className="figure text-right text-2xl font-bold text-teal-deep">{francs(voucher.totalAmount)}</p>
+          <p className="figure text-right text-2xl font-bold text-teal-deep">{francs(voucher.totalAmount ?? 0)}</p>
         </div>
         <div className="flex items-center gap-4 p-5">
           <div className={cn("relative size-32 shrink-0", pending && "opacity-25 blur-[2px]")}>
@@ -777,6 +890,234 @@ function Done({ voucher, providerName }: { voucher: IpmVoucher; providerName: st
 
       <div className="done-actions mt-auto grid gap-2.5 pt-6">
         <Link href={`/bons/${voucher.id}`} className="flex h-14 items-center justify-center rounded-2xl bg-teal text-lg font-semibold text-white">
+          Voir le bon
+        </Link>
+        <Link href="/" className="flex h-12 items-center justify-center rounded-2xl font-semibold text-teal">
+          Retour à l&apos;accueil
+        </Link>
+      </div>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Récapitulatif d'un bon de pharmacie. No amount, so no split: the server
+ * says whether the bon may be issued, at what taux, and what is left under
+ * the plafond — asked on arrival, and again when that check failed to arrive.
+ */
+function PharmacyRecap({
+  who,
+  providerId,
+  prescriptionUrl,
+  submitting,
+  failure,
+  onSubmit,
+}: {
+  who: FamilyMember
+  providerId: string
+  prescriptionUrl: string
+  submitting: boolean
+  failure: SubmitFailure | null
+  onSubmit: () => void
+}) {
+  const { db, session, previewPharmacy } = useStore()
+  const provider = db.providers.find((p) => p.id === providerId)
+  const [check, setCheck] = useState<
+    { kind: "loading" } | { kind: "ready"; preview: PharmacyPreviewResponse } | { kind: "error"; failure: SubmitFailure }
+  >({ kind: "loading" })
+  const [attempt, setAttempt] = useState(0)
+  const ref = beneficiaryRef(session!.memberId, who.dependentId)
+
+  useEffect(() => {
+    let alive = true
+    setCheck({ kind: "loading" })
+    previewPharmacy({ beneficiaryRef: ref, category: "PHARMACY", providerId })
+      .then((preview) => alive && setCheck({ kind: "ready", preview }))
+      .catch((error: unknown) => alive && setCheck({ kind: "error", failure: describeFailure(error) }))
+    return () => {
+      alive = false
+    }
+  }, [previewPharmacy, ref, providerId, attempt])
+
+  const preview = check.kind === "ready" ? check.preview : null
+  const checkFailure = check.kind === "error" ? check.failure : null
+  const refusals =
+    failure?.kind === "refused"
+      ? failure.messages
+      : checkFailure?.kind === "refused"
+        ? checkFailure.messages
+        : preview && !preview.allowed
+          ? preview.refusals
+          : []
+  const retryMessage = failure?.kind === "retry" ? failure.message : checkFailure?.kind === "retry" ? checkFailure.message : null
+
+  return (
+    <div className="flex flex-1 flex-col">
+      <div className="rounded-3xl bg-surface ring-1 ring-line">
+        <div className="flex items-center gap-3 border-b border-line p-4">
+          <Avatar person={who.person} rank={who.rank} />
+          <div className="min-w-0 flex-1">
+            <p className="font-semibold">{who.name}</p>
+            <p className="truncate text-sm text-ink-3">Bon de pharmacie chez {provider?.name ?? "la pharmacie"}</p>
+          </div>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={prescriptionUrl} alt="Ordonnance" className="size-12 rounded-lg object-cover ring-1 ring-line" />
+        </div>
+        <dl className="space-y-3 p-4 text-[0.95rem]">
+          <div className="flex items-baseline justify-between gap-4">
+            <dt className="text-ink-2">Montant</dt>
+            <dd className="text-right font-medium">Saisi par la pharmacie</dd>
+          </div>
+          {preview?.rate != null && (
+            <div className="flex items-baseline justify-between gap-4">
+              <dt className="text-ink-2">Prise en charge IPM</dt>
+              <dd className="figure text-xl font-semibold text-teal-deep">{Math.round(preview.rate * 100)} %</dd>
+            </div>
+          )}
+          {preview?.remainingCeiling != null && (
+            <div className="flex items-baseline justify-between gap-4">
+              <dt className="text-ink-2">Reste sur le plafond</dt>
+              <dd className="figure text-xl font-semibold">{francs(preview.remainingCeiling)}</dd>
+            </div>
+          )}
+          {preview && (
+            <div className="flex items-baseline justify-between gap-4">
+              <dt className="text-ink-2">Valable</dt>
+              <dd className="text-right font-medium">{preview.validationDays} jours</dd>
+            </div>
+          )}
+          {check.kind === "loading" && (
+            <p className="flex items-center gap-2 text-ink-3" role="status">
+              <HugeiconsIcon icon={Loading03Icon} className="size-4 animate-spin" /> Vérification de vos droits…
+            </p>
+          )}
+        </dl>
+      </div>
+
+      {refusals.length > 0 && (
+        <div role="alert" className="mt-4 rounded-2xl bg-red-tint p-4 text-red">
+          <p className="flex items-center gap-2 font-semibold">
+            <HugeiconsIcon icon={Alert02Icon} className="size-5" />
+            Ce bon ne peut pas être créé
+          </p>
+          <ul className="mt-2 space-y-1.5 text-[0.95rem]">
+            {refusals.map((message) => (
+              <li key={message}>{message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {retryMessage && (
+        <div role="alert" className="mt-4 flex gap-3 rounded-2xl bg-amber-tint p-4 text-amber">
+          <HugeiconsIcon icon={Alert02Icon} className="mt-0.5 size-5 shrink-0" />
+          <p className="text-[0.95rem]">{retryMessage} Votre saisie est conservée : appuyez sur « Réessayer ».</p>
+        </div>
+      )}
+
+      {refusals.length === 0 && !retryMessage && preview?.allowed && (
+        <>
+          {preview.warnings.length > 0 && (
+            <ul className="mt-4 space-y-1.5 rounded-2xl bg-amber-tint p-4 text-[0.95rem] text-amber">
+              {preview.warnings.map((w) => (
+                <li key={w}>{w}</li>
+              ))}
+            </ul>
+          )}
+          <p className="mt-4 text-center text-sm text-ink-2">
+            L&apos;IPM paie sa part dans la limite de votre plafond ; s&apos;il ne suffit pas, vous payez la différence à la pharmacie.
+            Rien n&apos;est déduit avant la validation.
+          </p>
+        </>
+      )}
+
+      <Button
+        onClick={() => {
+          // The eligibility check never arrived: ask again rather than issue blind.
+          if (checkFailure?.kind === "retry" && !failure) setAttempt((n) => n + 1)
+          else onSubmit()
+        }}
+        disabled={submitting || check.kind === "loading" || refusals.length > 0 || (preview !== null && !preview.allowed)}
+        aria-busy={submitting}
+        className="mt-auto h-14 rounded-2xl text-lg font-semibold"
+      >
+        {submitting && <HugeiconsIcon icon={Loading03Icon} className="size-5 animate-spin" />}
+        {submitting ? "Envoi en cours…" : retryMessage ? "Réessayer" : "Créer le bon"}
+      </Button>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------------ */
+
+function PharmacyDone({
+  issued,
+  beneficiaryName,
+  providerName,
+}: {
+  issued: PharmacyIssueResponse
+  beneficiaryName: string
+  providerName: string
+}) {
+  const scope = useRef<HTMLDivElement>(null)
+  const status = STATUS_META.AWAITING_AMOUNT
+
+  useGSAP(
+    () => {
+      if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return
+      gsap
+        .timeline()
+        .from(".done-stamp", { scale: 1.7, rotate: -14, opacity: 0, duration: 0.55, ease: "back.out(2.2)" })
+        .from(".done-ticket", { y: 40, opacity: 0, duration: 0.5, ease: "power3.out" }, "-=0.15")
+        .from(".done-actions > *", { y: 16, opacity: 0, stagger: 0.08, duration: 0.35 }, "-=0.2")
+    },
+    { scope }
+  )
+
+  return (
+    <div ref={scope} className="flex min-h-dvh flex-col px-5 pt-[max(env(safe-area-inset-top),28px)] pb-6">
+      <div className="flex flex-col items-center text-center">
+        <span className="done-stamp inline-flex size-20 items-center justify-center rounded-full bg-mint text-teal-deep">
+          <HugeiconsIcon icon={Tick02Icon} className="size-10" strokeWidth={2.2} />
+        </span>
+        <h1 className="figure mt-4 text-[2.3rem] leading-none font-bold">Votre bon est prêt</h1>
+        <p className="mt-2 max-w-72 text-ink-2">
+          Présentez ce code et votre ordonnance à {providerName}. La pharmacie saisira le montant.
+        </p>
+      </div>
+
+      <div className="done-ticket mt-6 overflow-hidden rounded-3xl bg-surface ring-1 ring-line">
+        <div className="flex items-center justify-between gap-3 border-b border-dashed border-line px-5 py-4">
+          <div>
+            <p className="text-sm text-ink-3">{VOUCHER_TYPE_META.PHARMACY.label}</p>
+            <p className="figure text-2xl font-bold tracking-wide">{issued.number}</p>
+          </div>
+          <Badge tone={status.tone}>
+            <HugeiconsIcon icon={HourglassIcon} />
+            {status.label}
+          </Badge>
+        </div>
+        <div className="flex items-center gap-4 p-5">
+          <div className="relative size-32 shrink-0">
+            {/* The bare token: what the pharmacy's scanner looks up. */}
+            <Qr value={issued.qrToken} className="size-full" />
+          </div>
+          <div className="min-w-0 text-sm">
+            <p className="font-semibold capitalize">{beneficiaryName.toLowerCase()}</p>
+            <p className="text-ink-2">Montant : saisi par la pharmacie</p>
+            <p className="mt-2 text-ink-3">À valider avant le {longDate(issued.expiresAt)}</p>
+          </div>
+        </div>
+        <div className="border-t border-dashed border-line px-5 py-3 text-center">
+          <p className="text-xs text-ink-3">Code à saisir si le scan échoue</p>
+          <p className="font-mono text-[0.95rem] font-semibold tracking-wide break-all select-all">{groupedCode(issued.qrToken)}</p>
+        </div>
+      </div>
+
+      <div className="done-actions mt-auto grid gap-2.5 pt-6">
+        <Link href={`/bons/${issued.voucherId}`} className="flex h-14 items-center justify-center rounded-2xl bg-teal text-lg font-semibold text-white">
           Voir le bon
         </Link>
         <Link href="/" className="flex h-12 items-center justify-center rounded-2xl font-semibold text-teal">

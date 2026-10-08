@@ -8,7 +8,13 @@ import type { ApiError as ApiErrorBody } from "@/lib/schema"
  * could not be reached. Callers never see a raw `TypeError` or `AbortError`.
  */
 
-export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3000/api/portail").replace(/\/$/, "")
+/**
+ * Same origin by default: `next.config.ts` forwards `/api/portail/*` to
+ * multiapp, so the portal works from any address it is opened on. Set
+ * `NEXT_PUBLIC_API_URL` only to call multiapp directly (it must then allow
+ * this origin in its `PORTAL_ORIGIN`).
+ */
+export const API_URL = (process.env.NEXT_PUBLIC_API_URL || "/api/portail").replace(/\/$/, "")
 export const FIRM_SLUG = process.env.NEXT_PUBLIC_PORTAL_FIRM_SLUG ?? "ipm-tawfeikh"
 
 const TOKEN_KEY = "ipm-portail:token"
@@ -94,9 +100,22 @@ type RequestOptions = {
   auth?: boolean
 }
 
-export async function api<T>(path: string, { method = "GET", json, form, auth = true }: RequestOptions = {}): Promise<T> {
+export type SendOptions = {
+  method?: "GET" | "POST"
+  json?: unknown
+  form?: FormData
+  /** Sent as `Authorization: Bearer`; null sends none. */
+  token: string | null
+}
+
+/**
+ * One request to `/api/portail/*`, nothing else: no token of its own, no
+ * sign-out. The participant client (`api`) and the pharmacy's
+ * (`lib/prestataire/api`) each add their own token and their own reaction to
+ * a refused one, so neither session can leak into the other.
+ */
+export async function send<T>(path: string, { method = "GET", json, form, token }: SendOptions): Promise<T> {
   const headers: Record<string, string> = {}
-  const token = auth ? getToken() : null
   if (token) headers.Authorization = `Bearer ${token}`
   if (json !== undefined) headers["Content-Type"] = "application/json"
 
@@ -129,21 +148,48 @@ export async function api<T>(path: string, { method = "GET", json, form, auth = 
 
   const error = (body as ApiErrorBody | null)?.error
   const retryAfter = Number(response.headers.get("Retry-After")) || null
-  const failure = new ApiError(
+  throw new ApiError(
     response.status,
     error?.code ?? "HTTP_" + response.status,
     error?.message ?? "Une erreur inattendue est survenue. Réessayez.",
     error?.details,
     retryAfter
   )
+}
 
-  // A refused token, or a locked account: this session is over. Not on
-  // `/session` itself, where 401 means a wrong code.
-  if (auth && (response.status === 401 || failure.code === "ACCOUNT_LOCKED")) {
-    clearToken()
-    for (const listener of unauthorizedListeners) listener()
+export async function api<T>(path: string, { method = "GET", json, form, auth = true }: RequestOptions = {}): Promise<T> {
+  try {
+    return await send<T>(path, { method, json, form, token: auth ? getToken() : null })
+  } catch (failure) {
+    // A refused token, or a locked account: this session is over. Not on
+    // `/session` itself, where 401 means a wrong code.
+    if (
+      auth &&
+      failure instanceof ApiError &&
+      (failure.status === 401 || failure.code === "ACCOUNT_LOCKED")
+    ) {
+      clearToken()
+      for (const listener of unauthorizedListeners) listener()
+    }
+    throw failure
   }
-  throw failure
+}
+
+/**
+ * A link multiapp minted to one of its own `/api/portail/*` routes (the
+ * signed ordonnance link), made to go through the same route as every other
+ * call. multiapp writes its own origin into the link (its `AUTH_URL`), which
+ * a phone on the LAN may not reach and an HTTPS page may not load; the path
+ * and its signature are all that matter.
+ */
+export function viaApi(url: string | null): string | null {
+  if (!url || !API_URL.startsWith("/")) return url
+  try {
+    const parsed = new URL(url)
+    return parsed.pathname.startsWith("/api/portail/") ? parsed.pathname + parsed.search : url
+  } catch {
+    return url
+  }
 }
 
 /** A data URL (what the receipt capture produces) as a Blob for multipart. */

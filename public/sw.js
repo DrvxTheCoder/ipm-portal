@@ -20,8 +20,13 @@ const VERSION = new URL(self.location.href).searchParams.get("v") || "dev"
 const CACHE = `ipm-portail-${VERSION}`
 
 /** Every screen. `/bons/~` is the shell for any `/bons/<id>`. */
-const ROUTES = ["/", "/bons", "/bons/~", "/bons/nouveau", "/famille", "/profil", "/carte", "/consommation", "/prestataires", "/connexion"]
+const ROUTES = [
+  "/", "/bons", "/bons/~", "/bons/nouveau", "/famille", "/profil", "/carte", "/consommation", "/prestataires", "/connexion",
+  // The pharmacy's space: shells only, its data always comes from the network.
+  "/prestataire", "/prestataire/connexion", "/prestataire/mot-de-passe", "/prestataire/scanner", "/prestataire/bons/~",
+]
 const BON_SHELL = "/bons/~"
+const PRESTATAIRE_BON_SHELL = "/prestataire/bons/~"
 
 const STATIC = [
   "/manifest.webmanifest",
@@ -110,10 +115,13 @@ async function navigate(request) {
     if (response.ok && response.type === "basic") cache.put(url.pathname, response.clone())
     return response
   } catch {
+    // A pharmacy page never falls back to the participant's home, nor the reverse.
+    const pharmacy = url.pathname === "/prestataire" || url.pathname.startsWith("/prestataire/")
     const cached =
       (await cache.match(url.pathname)) ??
       (url.pathname.startsWith("/bons/") ? await cache.match(BON_SHELL) : undefined) ??
-      (await cache.match("/"))
+      (url.pathname.startsWith("/prestataire/bons/") ? await cache.match(PRESTATAIRE_BON_SHELL) : undefined) ??
+      (await cache.match(pharmacy ? "/prestataire" : "/"))
     return cached ?? new Response("Hors ligne", { status: 503, headers: { "Content-Type": "text/plain; charset=utf-8" } })
   }
 }

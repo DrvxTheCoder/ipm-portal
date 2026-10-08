@@ -20,6 +20,11 @@ export function longDate(iso: string): string {
   })
 }
 
+/** "8 oct., 14:32". */
+export function dateTime(iso: string): string {
+  return new Date(iso).toLocaleString("fr-FR", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
+}
+
 export function monthLabel(year: number, month: number): string {
   return new Date(year, month - 1, 1).toLocaleDateString("fr-FR", { month: "long" })
 }

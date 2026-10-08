@@ -1,13 +1,13 @@
 import Link from "next/link"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { Badge } from "@/components/ui/badge"
-import { STATUS_META, VOUCHER_TYPE_META } from "@/components/portal/meta"
+import { statusMeta, VOUCHER_TYPE_META } from "@/components/portal/meta"
 import { francs, relativeDay } from "@/lib/format"
 import type { IpmVoucher } from "@/lib/schema"
 
 export function VoucherRow({ voucher, providerName }: { voucher: IpmVoucher; providerName: string }) {
   const type = VOUCHER_TYPE_META[voucher.type]
-  const status = STATUS_META[voucher.status]
+  const status = statusMeta(voucher)
   return (
     <Link
       href={`/bons/${voucher.id}`}
@@ -27,7 +27,11 @@ export function VoucherRow({ voucher, providerName }: { voucher: IpmVoucher; pro
         </span>
       </span>
       <span className="shrink-0 text-right">
-        <span className="figure block text-xl font-semibold">{francs(voucher.totalAmount)}</span>
+        {voucher.totalAmount === null ? (
+          <span className="block text-sm font-medium text-ink-3">Montant à venir</span>
+        ) : (
+          <span className="figure block text-xl font-semibold">{francs(voucher.totalAmount)}</span>
+        )}
         <span className="block text-xs text-ink-3">{relativeDay(voucher.issueDate)}</span>
       </span>
     </Link>
